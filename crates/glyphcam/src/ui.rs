@@ -52,6 +52,7 @@ pub struct GlyphApp {
     autostart_state: Option<bool>,
     image_path: String,
     toast: Option<(String, Instant)>,
+    close_prompt: bool,
     engine: Option<std::thread::JoinHandle<()>>,
     #[cfg(windows)]
     vcam_status: crate::vcam::install::Status,
@@ -145,6 +146,7 @@ impl GlyphApp {
             autostart_state: None,
             image_path,
             toast: None,
+            close_prompt: false,
             engine: Some(l.engine),
             #[cfg(windows)]
             vcam_status: crate::vcam::install::status(),
@@ -488,6 +490,10 @@ impl GlyphApp {
             _ => {}
         }
         ui.add_space(8.0);
+        Self::section(ui, "Share");
+        self.transfer_ui(ui);
+        let s = &mut self.s;
+        ui.add_space(4.0);
         if ui.button("Reset look to defaults").clicked() {
             let d = Settings::default();
             s.color_mode = d.color_mode;
@@ -700,7 +706,7 @@ impl GlyphApp {
         });
         ui.checkbox(
             &mut s.keep_camera_warm,
-            "Keep camera running when nothing is watching",
+            "Keep the webcam on even when nothing is using glyphcam",
         )
         .on_hover_text("Instant start, but the webcam light stays on and it uses more power.");
 
@@ -742,46 +748,140 @@ impl GlyphApp {
             ui.label("3. Choose \"OBS Virtual Camera\" in Discord, Zoom, FaceTime, Chrome…");
         }
 
-        Self::section(ui, "Local stream (OBS / browser)");
-        ui.checkbox(&mut s.stream_server, "Serve output on localhost");
-        ui.horizontal(|ui| {
-            let mut port = s.stream_port.to_string();
-            ui.label("Port");
-            if ui
-                .add(egui::TextEdit::singleline(&mut port).desired_width(60.0))
-                .changed()
-            {
-                if let Ok(p) = port.parse::<u16>() {
-                    s.stream_port = p;
-                }
+        Self::section(ui, "Web stream (OBS · browser · other devices)");
+        ui.checkbox(&mut s.stream_server, "Serve the output as a web stream");
+        ui.add_enabled_ui(s.stream_server, |ui| {
+            ui.checkbox(&mut s.stream_lan, "Allow other devices on my network")
+                .on_hover_text(
+                    "Lets another computer on your Wi-Fi/LAN (or Tailscale) watch the stream.",
+                );
+            if s.stream_lan {
+                ui.label(
+                    RichText::new("Anyone on your network can watch while this is on.")
+                        .color(Color32::from_rgb(255, 190, 90))
+                        .size(12.0),
+                );
             }
+            ui.horizontal(|ui| {
+                let mut port = s.stream_port.to_string();
+                ui.label("Port");
+                if ui
+                    .add(egui::TextEdit::singleline(&mut port).desired_width(60.0))
+                    .changed()
+                {
+                    if let Ok(p) = port.parse::<u16>() {
+                        s.stream_port = p;
+                    }
+                }
+            });
         });
+        let mut copied: Option<String> = None;
         if let Some(url) = &st.stream_url {
+            ui.label(RichText::new("This computer").color(MUTED).size(12.0));
             ui.horizontal(|ui| {
                 ui.monospace(url);
                 if ui.button("Copy").clicked() {
-                    ui.ctx().copy_text(url.clone());
-                    self.toast = Some(("URL copied".into(), Instant::now()));
+                    copied = Some(url.clone());
                 }
                 if ui.button("Open").clicked() {
                     ui.ctx().open_url(egui::OpenUrl::new_tab(url));
                 }
             });
+            if s.stream_lan {
+                ui.label(
+                    RichText::new("Other devices on your network")
+                        .color(MUTED)
+                        .size(12.0),
+                );
+                if st.stream_lan_urls.is_empty() {
+                    ui.label(
+                        RichText::new("Looking for this computer's network address…").color(MUTED),
+                    );
+                }
+                for entry in &st.stream_lan_urls {
+                    let (u, label) = entry.split_once("  ").unwrap_or((entry.as_str(), ""));
+                    ui.horizontal(|ui| {
+                        ui.monospace(RichText::new(u).color(ACCENT));
+                        if ui.button("Copy").clicked() {
+                            copied = Some(u.to_string());
+                        }
+                        ui.label(RichText::new(label).color(MUTED).size(12.0));
+                    });
+                }
+                ui.label(
+                    RichText::new(
+                        "On the other computer: OBS → + → Browser → paste the address (1280×720), then Start Virtual Camera to use it in Discord/Zoom. Or just open it in a browser.",
+                    )
+                    .color(MUTED)
+                    .size(12.0),
+                );
+                #[cfg(windows)]
+                if ui
+                    .button("Allow through Windows Firewall")
+                    .on_hover_text("Use this if other devices can't connect. Asks for administrator permission.")
+                    .clicked()
+                {
+                    let msg = match crate::platform::allow_firewall(s.stream_port) {
+                        Ok(()) => "Firewall rule requested".to_string(),
+                        Err(e) => format!("Firewall: {e}"),
+                    };
+                    self.toast = Some((msg, Instant::now()));
+                }
+            }
             ui.label(
                 RichText::new(format!(
-                    "{} viewer(s) connected · MJPEG at {url}stream.mjpg",
+                    "{} viewer(s) connected · raw MJPEG at …/stream.mjpg",
                     st.stream_clients
                 ))
                 .color(MUTED)
                 .size(12.0),
             );
         }
+        if let Some(u) = copied {
+            ui.ctx().copy_text(u);
+            self.toast = Some(("Address copied".into(), Instant::now()));
+        }
         if let Some(e) = &st.stream_error {
             ui.label(RichText::new(e).color(Color32::from_rgb(255, 120, 90)));
         }
     }
 
+    /// Copy/paste the whole look between machines.
+    fn transfer_ui(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            if ui
+                .button("📋 Copy settings")
+                .on_hover_text("Copies your look, framing and output format as a code you can paste on another computer.")
+                .clicked()
+            {
+                let code = crate::share::export(&self.s);
+                let msg = match crate::share::copy_to_clipboard(&code) {
+                    Ok(()) => "Settings copied. Paste them in glyphcam on your other computer.".to_string(),
+                    Err(e) => format!("Couldn't copy: {e}"),
+                };
+                self.toast = Some((msg, Instant::now()));
+            }
+            if ui.button("📥 Paste settings").on_hover_text("Applies settings copied from another glyphcam.").clicked() {
+                let msg = match crate::share::read_clipboard().and_then(|t| crate::share::import(&t, &self.s)) {
+                    Ok((new, n)) => {
+                        self.s = new;
+                        format!("Applied {n} settings")
+                    }
+                    Err(e) => e,
+                };
+                self.toast = Some((msg, Instant::now()));
+            }
+        });
+    }
+
     fn tab_app(&mut self, ui: &mut egui::Ui) {
+        Self::section(ui, "Move your setup to another computer");
+        ui.label(
+            RichText::new("Copy here, then Paste in glyphcam on the other machine (send the code via chat, notes…). Camera choice and app options stay per-computer.")
+                .color(MUTED)
+                .size(12.0),
+        );
+        self.transfer_ui(ui);
         Self::section(ui, "Background behavior");
         let auto = *self
             .autostart_state
@@ -1089,13 +1189,32 @@ impl eframe::App for GlyphApp {
         }
         if let Some(t) = &self.tray {
             t.set_vcam_checked(self.s.vcam_enabled);
+            let st = self.sh.status.lock();
+            let tip = if st.vcam_in_use {
+                "glyphcam: live in an app"
+            } else if !self.s.vcam_enabled && cfg!(windows) {
+                "glyphcam: virtual camera paused"
+            } else if st.active {
+                "glyphcam: camera on"
+            } else if st.error.is_some() {
+                "glyphcam: camera problem (open for details)"
+            } else {
+                "glyphcam: standing by (camera turns on when an app uses it)"
+            };
+            t.set_tooltip(tip);
         }
 
         // Close button hides to tray.
         if ctx.input(|i| i.viewport().close_requested()) && !self.quitting {
             if self.s.close_to_tray && self.tray.is_some() {
                 ctx.send_viewport_cmd(ViewportCommand::CancelClose);
-                self.hide(ctx);
+                if self.s.close_hint_shown {
+                    self.hide(ctx);
+                } else {
+                    // First time: explain what "closing" means.
+                    self.close_prompt = true;
+                    ctx.request_repaint();
+                }
             } else {
                 self.quit(ctx);
             }
@@ -1227,6 +1346,44 @@ impl eframe::App for GlyphApp {
                 }
             }
         });
+
+        if self.close_prompt {
+            let mut choice: Option<bool> = None;
+            egui::Modal::new(egui::Id::unique("close-hint")).show(&ctx, |ui| {
+                ui.set_max_width(420.0);
+                ui.label(RichText::new("glyphcam keeps running in the tray").strong().size(16.0).color(ACCENT));
+                ui.add_space(6.0);
+                ui.label(
+                    "The \"glyphcam\" camera stays available in Discord, Zoom, OBS and your browser. To save power and for privacy, your webcam turns off while nothing is using glyphcam, and turns back on by itself the moment an app (or this preview) needs it.",
+                );
+                ui.add_space(6.0);
+                ui.checkbox(&mut self.s.keep_camera_warm, "Keep the webcam on all the time instead (instant, uses more power)");
+                ui.label(RichText::new("You can change this later in Output.").color(MUTED).size(12.0));
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button(RichText::new("Hide to tray").strong()).clicked() {
+                        choice = Some(true);
+                    }
+                    if ui.button("Quit glyphcam").clicked() {
+                        choice = Some(false);
+                    }
+                });
+            });
+            match choice {
+                Some(true) => {
+                    self.close_prompt = false;
+                    self.s.close_hint_shown = true;
+                    self.commit_settings();
+                    self.hide(&ctx);
+                }
+                Some(false) => {
+                    self.close_prompt = false;
+                    self.s.close_hint_shown = true;
+                    self.quit(&ctx);
+                }
+                None => {}
+            }
+        }
 
         self.commit_settings();
         // Keep status text fresh without burning CPU.

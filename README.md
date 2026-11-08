@@ -5,7 +5,7 @@ A real-time glyph-art face camera. glyphcam takes your webcam feed, tracks your 
 - **Face-stabilized like a game view model.** Your face stays roughly fixed in the frame while you move around. It sways and lags a little, but it never leaves the frame. Expressions stay fully in sync because every glyph comes from the live camera image.
 - **Shading and depth mapped to glyphs.** Brightness picks the glyph density. A 3D head model fitted to your face shades the result. Background separation can dim or hide the background, or replace it with falling digital rain.
 - **Looks:** Matrix green, true color, monochrome, amber, ice, crimson, synthwave, thermal, or your own colors. Six glyph presets, or a custom mix of scripts.
-- **Light enough to leave running.** It's written in Rust with pure-Rust inference (`tract`). The real camera only turns on while something is watching. Idle in the tray it uses about 1–2% CPU, and the webcam light stays off.
+- **Light enough to leave running.** It's written in Rust with pure-Rust inference (`tract`). The real camera only turns on while something is watching, such as Discord using the glyphcam camera, the preview or a stream viewer. It stays warm for 20 seconds afterwards. Idle in the tray it uses about 1–2% CPU and the webcam light is off. You can choose **Keep the webcam on** in Output if you prefer instant starts.
 - **Control panel, not output window.** Toggle the virtual camera and the preview, and adjust settings. Closing the window hides glyphcam to the tray (Windows) or menu bar (macOS).
 - **Built-in build manager.** Browse GitHub releases and the rolling `nightly` build, then install, update or downgrade in one click.
 
@@ -38,6 +38,22 @@ The virtual camera is a DirectShow source filter, registered for your user, in b
 
 The same local stream works on Windows too. Any app can read `http://127.0.0.1:8737/stream.mjpg` (MJPEG).
 
+### Watching from another computer
+
+To run glyphcam on one machine (the one with the webcam) and use it on another:
+
+1. On the glyphcam machine, open **Output → Web stream** and turn on **Allow other devices on my network**. glyphcam shows addresses such as `http://192.168.1.20:8737/`, plus your Tailscale address if you use Tailscale.
+2. On the other computer, add a **Browser** source in OBS with that address (1280×720), then click **Start Virtual Camera** to use it in Discord or Zoom. You can also just open the address in a browser.
+3. If the other computer can't connect, allow glyphcam through the firewall:
+   - Windows asks the first time you turn on network access. You can also click **Allow through Windows Firewall** in glyphcam.
+   - On macOS, accept the "incoming connections" prompt.
+
+Anyone on your network can watch while network access is on. It is off by default.
+
+### Copying your setup to another machine
+
+Click **Copy settings** (in **App**, or at the bottom of **Look**) to copy a code. Send it to yourself, then click **Paste settings** in glyphcam on the other machine. The code carries your look, framing and output format. Camera choice and app options stay per computer.
+
 ## Using it
 
 | Control | What it does |
@@ -48,7 +64,7 @@ The same local stream works on Windows too. Any app can read `http://127.0.0.1:8
 | **Framing** | Stabilization on/off, face size and position, sway, tilt, idle drift, keep upright, mirror. |
 | **Camera** | Camera device and quality, or **Demo** / **Image file** inputs for testing without a webcam. |
 | **Output** | Resolution (640×360 to 1920×1080), fps, virtual camera status and repair, local stream server. |
-| **App** | Start at login, start hidden, close-to-tray, logs. |
+| **App** | Copy/paste settings between machines, start at login, start hidden, close-to-tray, logs. |
 | **Updates** | List, install, update or switch builds from GitHub. |
 
 ## Building from source

@@ -5,6 +5,7 @@ mod camera;
 mod config;
 mod engine;
 mod platform;
+mod share;
 mod stream;
 mod tray;
 mod ui;

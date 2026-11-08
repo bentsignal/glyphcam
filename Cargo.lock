@@ -256,7 +256,7 @@ dependencies = [
  "objc2-foundation 0.3.2",
  "parking_lot 0.12.5",
  "percent-encoding",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
  "x11rb",
 ]
 
@@ -2031,16 +2031,19 @@ dependencies = [
 
 [[package]]
 name = "glyphcam"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
+ "arboard",
  "auto-launch",
+ "base64",
  "directories",
  "eframe",
  "embed-resource",
  "env_logger",
  "glyphcam-core",
  "glyphcam-shm",
+ "if-addrs",
  "image",
  "jpeg-encoder",
  "log",
@@ -2061,7 +2064,7 @@ dependencies = [
 
 [[package]]
 name = "glyphcam-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "fontdue",
@@ -2075,14 +2078,14 @@ dependencies = [
 
 [[package]]
 name = "glyphcam-shm"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "windows",
 ]
 
 [[package]]
 name = "glyphcam-vcam-dshow"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "glyphcam-shm",
  "windows",
@@ -2365,6 +2368,16 @@ checksum = "cb68373c0d6620ef8105e855e7745e18b0d00d3bdb07fb532e434244cdb9a714"
 dependencies = [
  "icu_normalizer",
  "icu_properties",
+]
+
+[[package]]
+name = "if-addrs"
+version = "0.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c0a05c691e1fae256cf7013d99dad472dc52d5543322761f83ec8d47eab40d2b"
+dependencies = [
+ "libc",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

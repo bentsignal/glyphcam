@@ -13,11 +13,19 @@ pub enum TrayCmd {
 }
 
 pub struct Tray {
-    _icon: TrayIcon,
+    icon: TrayIcon,
+    tooltip: std::cell::RefCell<String>,
     vcam_item: CheckMenuItem,
 }
 
 impl Tray {
+    pub fn set_tooltip(&self, text: &str) {
+        if *self.tooltip.borrow() != text {
+            let _ = self.icon.set_tooltip(Some(text));
+            *self.tooltip.borrow_mut() = text.to_owned();
+        }
+    }
+
     pub fn set_vcam_checked(&self, on: bool) {
         if self.vcam_item.is_checked() != on {
             self.vcam_item.set_checked(on);
@@ -125,7 +133,8 @@ pub fn create(
     }
     let icon = b.build()?;
     Ok(Tray {
-        _icon: icon,
+        icon,
+        tooltip: std::cell::RefCell::new("glyphcam".into()),
         vcam_item,
     })
 }

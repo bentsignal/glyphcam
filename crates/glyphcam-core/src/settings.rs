@@ -262,6 +262,10 @@ pub struct Settings {
     pub preview: bool,
     pub stream_server: bool,
     pub stream_port: u16,
+    /// Serve the stream to other devices on the local network (not just this computer).
+    pub stream_lan: bool,
+    /// The first-close explanation has been shown.
+    pub close_hint_shown: bool,
     pub keep_camera_warm: bool,
     pub start_minimized: bool,
     pub autostart: bool,
@@ -307,6 +311,8 @@ impl Default for Settings {
             preview: true,
             stream_server: true,
             stream_port: 8737,
+            stream_lan: false,
+            close_hint_shown: false,
             keep_camera_warm: false,
             start_minimized: false,
             autostart: false,

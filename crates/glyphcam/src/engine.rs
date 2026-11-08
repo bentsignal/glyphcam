@@ -29,6 +29,8 @@ pub struct Status {
     pub vcam_in_use: bool,
     pub stream_clients: usize,
     pub stream_url: Option<String>,
+    /// Addresses other devices can use (LAN access on).
+    pub stream_lan_urls: Vec<String>,
     pub stream_error: Option<String>,
     pub error: Option<String>,
 }
@@ -113,7 +115,15 @@ fn run(sh: Arc<Shared>) {
         }
     };
     let mut stream: Option<StreamServer> = None;
-    let mut stream_failed_port: Option<u16> = None;
+    let mut stream_failed_port: Option<(u16, bool)> = None;
+    // Keep the camera open briefly after the last viewer leaves, so closing
+    // and reopening the window (or apps re-opening the camera while you
+    // browse their settings) doesn't restart the webcam every time.
+    const LINGER: Duration = Duration::from_secs(20);
+    let mut last_demand = Instant::now() - LINGER;
+    let mut lan_urls: Vec<String> = Vec::new();
+    let mut lan_checked = Instant::now() - Duration::from_secs(3600);
+    let mut status_key = (false, false, false, false);
     let mut source = Source::None;
     let mut camera_retry_at = Instant::now();
     let mut last_frame = Instant::now();
@@ -129,11 +139,12 @@ fn run(sh: Arc<Shared>) {
 
         // --- stream server lifecycle ---
         if s.stream_server {
-            if stream.as_ref().map(|x| x.port) != Some(s.stream_port)
-                && stream_failed_port != Some(s.stream_port)
+            let key = (s.stream_port, s.stream_lan);
+            if stream.as_ref().map(|x| (x.port, x.lan)) != Some(key)
+                && stream_failed_port != Some(key)
             {
                 stream = None;
-                match StreamServer::start(s.stream_port) {
+                match StreamServer::start(s.stream_port, s.stream_lan) {
                     Ok(srv) => {
                         log::info!("stream server on {}", srv.url());
                         stream_failed_port = None;
@@ -141,7 +152,7 @@ fn run(sh: Arc<Shared>) {
                     }
                     Err(e) => {
                         log::warn!("stream server failed on port {}: {e}", s.stream_port);
-                        stream_failed_port = Some(s.stream_port);
+                        stream_failed_port = Some(key);
                         sh.status.lock().stream_error =
                             Some(format!("Port {} unavailable: {e}", s.stream_port));
                     }
@@ -175,11 +186,41 @@ fn run(sh: Arc<Shared>) {
             st.vcam_in_use = consumer;
             st.stream_clients = watchers;
             st.stream_url = stream.as_ref().map(|x| x.url());
+            if stream.as_ref().map(|x| x.lan).unwrap_or(false) {
+                if lan_checked.elapsed() > Duration::from_secs(10) {
+                    lan_urls = stream.as_ref().map(|x| x.lan_urls()).unwrap_or_default();
+                    lan_checked = Instant::now();
+                }
+            } else {
+                lan_urls.clear();
+                lan_checked = Instant::now() - Duration::from_secs(3600);
+            }
+            st.stream_lan_urls = lan_urls.clone();
+            // Wake the UI (even when hidden) so the tray tooltip stays accurate.
             if stream.is_some() {
                 st.stream_error = None;
             }
+            let key = (st.active, consumer, watchers > 0, st.error.is_some());
+            drop(st);
+            if key != status_key {
+                status_key = key;
+                sh.repaint();
+            }
         }
 
+        if demand {
+            last_demand = Instant::now();
+        }
+        if !demand && matches!(source, Source::Camera { .. }) && last_demand.elapsed() < LINGER {
+            // Standby: camera stays open, nothing is rendered.
+            vcam.set_state(if s.vcam_enabled {
+                WriterState::Starting
+            } else {
+                WriterState::Paused
+            });
+            std::thread::sleep(Duration::from_millis(50));
+            continue;
+        }
         if !demand {
             if !matches!(source, Source::None) {
                 log::info!("idle: releasing source");

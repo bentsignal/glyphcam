@@ -118,6 +118,34 @@ pub fn macos_show() {
     }
 }
 
+/// Add an inbound Windows Firewall rule for the stream port (UAC prompt).
+#[cfg(windows)]
+pub fn allow_firewall(port: u16) -> anyhow::Result<()> {
+    use windows::core::{HSTRING, PCWSTR};
+    use windows::Win32::UI::Shell::ShellExecuteW;
+    use windows::Win32::UI::WindowsAndMessaging::SW_HIDE;
+    let exe = std::env::current_exe()?;
+    let name = "glyphcam stream";
+    let args = format!(
+        "/c netsh advfirewall firewall delete rule name=\"{name}\" & netsh advfirewall firewall add rule name=\"{name}\" dir=in action=allow protocol=TCP localport={port} program=\"{}\" profile=private,domain enable=yes",
+        exe.display()
+    );
+    let r = unsafe {
+        ShellExecuteW(
+            None,
+            &HSTRING::from("runas"),
+            &HSTRING::from("cmd.exe"),
+            &HSTRING::from(args),
+            PCWSTR::null(),
+            SW_HIDE,
+        )
+    };
+    if r.0 as isize <= 32 {
+        anyhow::bail!("cancelled or not permitted");
+    }
+    Ok(())
+}
+
 pub fn open_path(p: &std::path::Path) {
     let _ = std::fs::create_dir_all(p);
     #[cfg(windows)]

@@ -21,6 +21,8 @@ struct Inner {
 pub struct StreamServer {
     inner: Arc<Inner>,
     pub port: u16,
+    /// Listening on all interfaces (reachable from the LAN).
+    pub lan: bool,
 }
 
 const PAGE: &str = r#"<!doctype html><html><head><meta charset="utf-8"><title>glyphcam</title>
@@ -29,8 +31,9 @@ img{width:100vw;height:100vh;object-fit:contain;display:block}</style></head>
 <body><img src="/stream.mjpg" alt=""></body></html>"#;
 
 impl StreamServer {
-    pub fn start(port: u16) -> std::io::Result<Self> {
-        let listener = TcpListener::bind(("127.0.0.1", port))?;
+    pub fn start(port: u16, lan: bool) -> std::io::Result<Self> {
+        let host = if lan { "0.0.0.0" } else { "127.0.0.1" };
+        let listener = TcpListener::bind((host, port))?;
         listener.set_nonblocking(true)?;
         let inner = Arc::new(Inner {
             jpeg: Mutex::new((0, None)),
@@ -57,7 +60,7 @@ impl StreamServer {
                     }
                 }
             })?;
-        Ok(StreamServer { inner, port })
+        Ok(StreamServer { inner, port, lan })
     }
 
     pub fn clients(&self) -> usize {
@@ -90,6 +93,17 @@ impl StreamServer {
 
     pub fn url(&self) -> String {
         format!("http://127.0.0.1:{}/", self.port)
+    }
+
+    /// URLs other devices can use (empty unless LAN access is on).
+    pub fn lan_urls(&self) -> Vec<String> {
+        if !self.lan {
+            return Vec::new();
+        }
+        lan_addresses()
+            .into_iter()
+            .map(|(ip, label)| format!("http://{ip}:{}/  ({label})", self.port))
+            .collect()
     }
 }
 
@@ -208,4 +222,70 @@ fn handle(mut sock: TcpStream, inner: Arc<Inner>) {
             );
         }
     }
+}
+
+/// This machine's IPv4 addresses that other devices could reach, best first
+/// (the default-route address, then other LAN / Tailscale ones), with a label.
+/// Virtual adapters (WSL, Hyper-V, Docker, VMs) are skipped.
+pub fn lan_addresses() -> Vec<(std::net::Ipv4Addr, &'static str)> {
+    use std::net::{IpAddr, Ipv4Addr, UdpSocket};
+    // Connecting a UDP socket sends nothing; it just picks the outgoing interface.
+    let primary = UdpSocket::bind(("0.0.0.0", 0))
+        .and_then(|s| s.connect(("192.0.2.1", 9)).map(|_| s))
+        .and_then(|s| s.local_addr())
+        .ok()
+        .and_then(|a| match a.ip() {
+            IpAddr::V4(v) if !v.is_unspecified() && !v.is_loopback() => Some(v),
+            _ => None,
+        });
+    let tailscale = |v: &Ipv4Addr| v.octets()[0] == 100 && (64..128).contains(&v.octets()[1]);
+    let usable = |v: &Ipv4Addr| {
+        !v.is_loopback()
+            && !v.is_link_local()
+            && !v.is_unspecified()
+            && (v.is_private() || tailscale(v))
+    };
+    let virtual_if = |name: &str| {
+        let n = name.to_ascii_lowercase();
+        [
+            "vethernet",
+            "wsl",
+            "hyper-v",
+            "docker",
+            "virtualbox",
+            "vmware",
+            "vmnet",
+            "vboxnet",
+            "bridge",
+            "utun",
+        ]
+        .iter()
+        .any(|k| n.contains(k))
+    };
+    let mut out: Vec<(Ipv4Addr, &'static str)> = Vec::new();
+    let ifs = if_addrs::get_if_addrs().unwrap_or_default();
+    let label = |v: &Ipv4Addr, name: &str| -> &'static str {
+        if tailscale(v) || name.to_ascii_lowercase().contains("tailscale") {
+            "Tailscale"
+        } else {
+            "local network"
+        }
+    };
+    if let Some(p) = primary {
+        let name = ifs
+            .iter()
+            .find(|i| i.ip() == IpAddr::V4(p))
+            .map(|i| i.name.clone())
+            .unwrap_or_default();
+        out.push((p, label(&p, &name)));
+    }
+    for i in &ifs {
+        if let IpAddr::V4(v) = i.ip() {
+            let ts = tailscale(&v) || i.name.to_ascii_lowercase().contains("tailscale");
+            if usable(&v) && (ts || !virtual_if(&i.name)) && !out.iter().any(|(a, _)| *a == v) {
+                out.push((v, label(&v, &i.name)));
+            }
+        }
+    }
+    out
 }

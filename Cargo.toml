@@ -1,0 +1,33 @@
+[workspace]
+resolver = "2"
+members = ["crates/glyphcam-core", "crates/glyphcam-shm", "crates/glyphcam-vcam-dshow", "crates/glyphcam"]
+default-members = ["crates/glyphcam"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/bentsignal/glyphcam"
+authors = ["bentsignal"]
+
+[workspace.dependencies]
+glyphcam-core = { path = "crates/glyphcam-core" }
+glyphcam-shm = { path = "crates/glyphcam-shm" }
+anyhow = "1"
+log = "0.4"
+parking_lot = "0.12"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+windows = "0.62"
+windows-core = "0.62"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 4
+strip = true
+panic = "unwind"
+
+# Inference and image code is slow in debug; optimize deps even in dev builds.
+[profile.dev.package."*"]
+opt-level = 3

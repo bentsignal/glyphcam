@@ -1,10 +1,10 @@
 [workspace]
 resolver = "2"
-members = ["crates/glyphcam-core", "crates/glyphcam-shm", "crates/glyphcam-vcam-dshow", "crates/glyphcam"]
+members = ["crates/glyphcam-core", "crates/glyphcam-shm", "crates/glyphcam-vcam-dshow", "crates/glyphcam-vcam-mf", "crates/glyphcam"]
 default-members = ["crates/glyphcam"]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/bentsignal/glyphcam"

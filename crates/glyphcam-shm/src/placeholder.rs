@@ -1,7 +1,7 @@
 //! "No signal" frames shown when glyphcam isn't feeding live frames, drawn
 //! with a tiny built-in 5x7 bitmap font (no font files in the DLL).
 
-use glyphcam_shm::WriterState;
+use crate::WriterState;
 
 fn glyph(c: char) -> [u8; 7] {
     match c.to_ascii_uppercase() {

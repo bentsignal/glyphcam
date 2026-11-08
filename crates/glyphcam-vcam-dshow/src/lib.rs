@@ -10,7 +10,6 @@
 mod convert;
 mod filter;
 mod media;
-mod placeholder;
 
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicPtr, Ordering};

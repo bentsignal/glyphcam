@@ -10,13 +10,13 @@ use windows::Win32::Security::Authorization::{
 };
 use windows::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
 use windows::Win32::System::Memory::{
-    CreateFileMappingW, MapViewOfFile, UnmapViewOfFile, FILE_MAP_ALL_ACCESS,
+    CreateFileMappingW, MapViewOfFile, OpenFileMappingW, UnmapViewOfFile, FILE_MAP_ALL_ACCESS,
     MEMORY_MAPPED_VIEW_ADDRESS, PAGE_READWRITE,
 };
 use windows::Win32::System::Registry::{
     RegCloseKey, RegCreateKeyExW, RegDeleteTreeW, RegGetValueW, RegOpenKeyExW, RegSetValueExW,
-    HKEY, HKEY_CURRENT_USER, KEY_ALL_ACCESS, KEY_READ, KEY_WOW64_32KEY, KEY_WOW64_64KEY,
-    REG_BINARY, REG_OPTION_NON_VOLATILE, REG_SAM_FLAGS, REG_SZ, RRF_RT_REG_SZ,
+    HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_ALL_ACCESS, KEY_READ, KEY_WOW64_32KEY,
+    KEY_WOW64_64KEY, REG_BINARY, REG_OPTION_NON_VOLATILE, REG_SAM_FLAGS, REG_SZ, RRF_RT_REG_SZ,
 };
 
 pub struct SharedMapping {
@@ -29,13 +29,38 @@ unsafe impl Send for SharedMapping {}
 unsafe impl Sync for SharedMapping {}
 
 impl SharedMapping {
-    /// Create the mapping, or open it if another process already did.
+    /// Create the per-session mapping (DirectShow camera), or open it if
+    /// another process already did.
     pub fn open_or_create() -> windows::core::Result<Self> {
+        // Everyone + AppContainers may read/write; low-integrity processes
+        // (sandboxed browser helpers) are allowed to write too.
+        Self::create_named(MAPPING_NAME, "D:(A;;GA;;;WD)(A;;GA;;;AC)S:(ML;;NW;;;LW)")
+    }
+
+    /// Create (or open) the machine-wide mapping for the Media Foundation
+    /// camera. Only processes with SeCreateGlobalPrivilege can create it
+    /// (the Frame Server service); the DACL lets the interactive user's
+    /// glyphcam open it for writing.
+    pub fn create_global() -> windows::core::Result<Self> {
+        Self::create_named(
+            crate::MF_MAPPING_NAME,
+            "D:(A;;GA;;;WD)(A;;GA;;;SY)(A;;GA;;;LS)(A;;GA;;;IU)(A;;GA;;;AC)S:(ML;;NW;;;LW)",
+        )
+    }
+
+    /// Open the machine-wide mapping if the camera service created it.
+    pub fn open_global() -> windows::core::Result<Self> {
         unsafe {
-            // Everyone + AppContainers may read/write; low-integrity
-            // processes (sandboxed browser helpers) are allowed to write too.
+            let name = HSTRING::from(crate::MF_MAPPING_NAME);
+            let handle = OpenFileMappingW(FILE_MAP_ALL_ACCESS.0, false, &name)?;
+            Self::map(handle)
+        }
+    }
+
+    fn create_named(name: &str, sddl: &str) -> windows::core::Result<Self> {
+        unsafe {
             let mut sd = PSECURITY_DESCRIPTOR::default();
-            let sddl = HSTRING::from("D:(A;;GA;;;WD)(A;;GA;;;AC)S:(ML;;NW;;;LW)");
+            let sddl = HSTRING::from(sddl);
             let have_sd = ConvertStringSecurityDescriptorToSecurityDescriptorW(
                 &sddl,
                 SDDL_REVISION_1,
@@ -48,7 +73,7 @@ impl SharedMapping {
                 lpSecurityDescriptor: sd.0,
                 bInheritHandle: false.into(),
             };
-            let name = HSTRING::from(MAPPING_NAME);
+            let name = HSTRING::from(name);
             let size = TOTAL_SIZE as u64;
             let handle = CreateFileMappingW(
                 INVALID_HANDLE_VALUE,
@@ -61,21 +86,24 @@ impl SharedMapping {
             if have_sd {
                 let _ = LocalFree(Some(HLOCAL(sd.0)));
             }
-            let handle = handle?;
-            let view = MapViewOfFile(handle, FILE_MAP_ALL_ACCESS, 0, 0, TOTAL_SIZE);
-            if view.Value.is_null() {
-                let err = windows::core::Error::from_thread();
-                let _ = CloseHandle(handle);
-                return Err(err);
-            }
-            let region = Region::from_raw(view.Value as *mut u8);
-            region.init();
-            Ok(SharedMapping {
-                handle,
-                view,
-                region,
-            })
+            Self::map(handle?)
         }
+    }
+
+    unsafe fn map(handle: HANDLE) -> windows::core::Result<Self> {
+        let view = MapViewOfFile(handle, FILE_MAP_ALL_ACCESS, 0, 0, TOTAL_SIZE);
+        if view.Value.is_null() {
+            let err = windows::core::Error::from_thread();
+            let _ = CloseHandle(handle);
+            return Err(err);
+        }
+        let region = Region::from_raw(view.Value as *mut u8);
+        region.init();
+        Ok(SharedMapping {
+            handle,
+            view,
+            region,
+        })
     }
 
     pub fn region(&self) -> &Region {
@@ -269,6 +297,100 @@ pub fn registered_dll(wow32: bool) -> Option<PathBuf> {
         RegOpenKeyExW(HKEY_CURRENT_USER, &path, None, KEY_READ | view, &mut k)
             .ok()
             .ok()?;
+        let key = Key(k);
+        let mut buf = vec![0u16; 1024];
+        let mut len = (buf.len() * 2) as u32;
+        RegGetValueW(
+            key.0,
+            PCWSTR::null(),
+            PCWSTR::null(),
+            RRF_RT_REG_SZ,
+            None,
+            Some(buf.as_mut_ptr() as *mut _),
+            Some(&mut len),
+        )
+        .ok()
+        .ok()?;
+        let n = (len as usize / 2).saturating_sub(1);
+        Some(PathBuf::from(String::from_utf16_lossy(&buf[..n])))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Media Foundation (Windows 11) camera source: machine-wide registration.
+// The Frame Server service only looks in HKLM, so this needs admin rights.
+// ---------------------------------------------------------------------------
+
+pub fn mf_source_clsid() -> GUID {
+    GUID::from_u128(0x6F1E8A52_3C7D_4B9E_A1F0_5D2C8E4B7A93)
+}
+
+fn create_key_in(root: HKEY, path: &str) -> windows::core::Result<Key> {
+    let mut k = HKEY::default();
+    unsafe {
+        RegCreateKeyExW(
+            root,
+            &HSTRING::from(path),
+            None,
+            PCWSTR::null(),
+            REG_OPTION_NON_VOLATILE,
+            KEY_ALL_ACCESS | KEY_WOW64_64KEY,
+            None,
+            &mut k,
+            None,
+        )
+        .ok()?;
+    }
+    Ok(Key(k))
+}
+
+/// Register the MF source DLL in HKLM (64-bit view). Requires elevation.
+pub fn register_mf_source(dll: &Path) -> windows::core::Result<()> {
+    let base = format!("Software\\Classes\\CLSID\\{}", crate::MF_SOURCE_CLSID);
+    let k = create_key_in(HKEY_LOCAL_MACHINE, &base)?;
+    set_sz(&k, None, "glyphcam camera source")?;
+    let k = create_key_in(HKEY_LOCAL_MACHINE, &format!("{base}\\InprocServer32"))?;
+    set_sz(&k, None, &dll.to_string_lossy())?;
+    set_sz(&k, Some("ThreadingModel"), "Both")?;
+    Ok(())
+}
+
+/// Remove the HKLM registration. Requires elevation.
+pub fn unregister_mf_source() {
+    unsafe {
+        let mut k = HKEY::default();
+        if RegOpenKeyExW(
+            HKEY_LOCAL_MACHINE,
+            &HSTRING::from("Software\\Classes\\CLSID"),
+            None,
+            KEY_ALL_ACCESS | KEY_WOW64_64KEY,
+            &mut k,
+        )
+        .is_ok()
+        {
+            let _ = RegDeleteTreeW(k, &HSTRING::from(crate::MF_SOURCE_CLSID));
+            let _ = RegCloseKey(k);
+        }
+    }
+}
+
+/// DLL registered for the MF source, if any (readable without admin).
+pub fn registered_mf_dll() -> Option<PathBuf> {
+    let path = HSTRING::from(format!(
+        "Software\\Classes\\CLSID\\{}\\InprocServer32",
+        crate::MF_SOURCE_CLSID
+    ));
+    unsafe {
+        let mut k = HKEY::default();
+        RegOpenKeyExW(
+            HKEY_LOCAL_MACHINE,
+            &path,
+            None,
+            KEY_READ | KEY_WOW64_64KEY,
+            &mut k,
+        )
+        .ok()
+        .ok()?;
         let key = Key(k);
         let mut buf = vec![0u16; 1024];
         let mut len = (buf.len() * 2) as u32;

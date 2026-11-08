@@ -11,13 +11,14 @@ VERSION=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
 LABEL="${GLYPHCAM_LABEL:-$VERSION}"
 MAKENSIS="${MAKENSIS:-makensis}"
 
-cargo build --release --locked -p glyphcam -p glyphcam-vcam-dshow
+cargo build --release --locked -p glyphcam -p glyphcam-vcam-dshow -p glyphcam-vcam-mf
 cargo build --release --locked -p glyphcam-vcam-dshow --target i686-pc-windows-msvc
 
 rm -rf dist/stage && mkdir -p dist/stage
 cp target/release/glyphcam.exe dist/stage/
 cp target/release/glyphcam_vcam.dll dist/stage/glyphcam-vcam-x64.dll
 cp target/i686-pc-windows-msvc/release/glyphcam_vcam.dll dist/stage/glyphcam-vcam-x86.dll
+cp target/release/glyphcam_mfcam.dll dist/stage/glyphcam-mfcam.dll
 cp LICENSE dist/stage/LICENSE.txt
 cp THIRD-PARTY.md dist/stage/THIRD-PARTY.txt
 

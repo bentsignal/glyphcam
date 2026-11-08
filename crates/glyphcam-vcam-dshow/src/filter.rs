@@ -3,7 +3,7 @@
 
 use crate::convert::convert;
 use crate::media::{self, Fmt};
-use crate::placeholder;
+use glyphcam_shm::placeholder;
 use glyphcam_shm::win::{filter_clsid, SharedMapping};
 use glyphcam_shm::WriterState;
 use std::ffi::c_void;

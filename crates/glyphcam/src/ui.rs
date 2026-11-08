@@ -56,6 +56,11 @@ pub struct GlyphApp {
     engine: Option<std::thread::JoinHandle<()>>,
     #[cfg(windows)]
     vcam_status: crate::vcam::install::Status,
+    #[cfg(windows)]
+    mf_status: crate::mfcam::Status,
+    /// Windows 11 camera setup running in the background: None = idle.
+    #[cfg(windows)]
+    mf_job: Arc<parking_lot::Mutex<Option<Option<Result<(), String>>>>>,
 }
 
 pub struct Launch {
@@ -150,6 +155,10 @@ impl GlyphApp {
             engine: Some(l.engine),
             #[cfg(windows)]
             vcam_status: crate::vcam::install::status(),
+            #[cfg(windows)]
+            mf_status: crate::mfcam::status(),
+            #[cfg(windows)]
+            mf_job: Arc::new(parking_lot::Mutex::new(None)),
         };
         if l.start_hidden && app.tray.is_some() {
             app.hide(&cc.egui_ctx);
@@ -713,15 +722,21 @@ impl GlyphApp {
         Self::section(ui, "Virtual camera");
         #[cfg(windows)]
         {
-            ui.label("Pick \"glyphcam\" as the camera in Discord, Zoom, OBS (Video Capture Device), Teams, Chrome, Edge, Firefox…");
+            self.system_camera_ui(ui);
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new("Classic camera (OBS, Zoom, browsers, Windows 10)")
+                    .strong()
+                    .size(13.0),
+            );
             let vs = &self.vcam_status;
             if vs.ok() {
-                ui.label(RichText::new("✔ Installed for this user").color(ACCENT));
+                ui.label(RichText::new("✔ \"glyphcam\" is installed for this user").color(ACCENT));
             } else {
                 ui.label(RichText::new("✖ Not registered").color(Color32::from_rgb(255, 150, 80)));
             }
             ui.horizontal(|ui| {
-                if ui.button("Repair registration").clicked() {
+                if ui.button("Repair").clicked() {
                     match crate::vcam::install::ensure_registered() {
                         Ok(()) => {
                             self.toast = Some(("Virtual camera registered".into(), Instant::now()))
@@ -732,22 +747,36 @@ impl GlyphApp {
                     }
                     self.vcam_status = crate::vcam::install::status();
                 }
-                if ui.button("Remove from system").clicked() {
+                if ui.button("Remove").clicked() {
                     crate::vcam::install::unregister();
                     self.vcam_status = crate::vcam::install::status();
                 }
             });
-            ui.label(RichText::new("Apps that were already open may need a restart to see a newly installed camera.").color(MUTED).size(12.0));
+            ui.label(
+                RichText::new(
+                    "Restart apps that were already open so they see a newly installed camera.",
+                )
+                .color(MUTED)
+                .size(12.0),
+            );
         }
         #[cfg(not(windows))]
         {
-            ui.label(RichText::new("macOS: a system camera needs a signed Camera Extension (coming once the app is signed).").color(Color32::from_rgb(255, 190, 90)));
-            ui.label("For now, use OBS's built-in virtual camera:");
+            ui.label(
+                RichText::new("No macOS system camera in this build.")
+                    .color(Color32::from_rgb(255, 190, 90))
+                    .strong(),
+            );
+            ui.label(
+                RichText::new("macOS only accepts virtual cameras as an Apple-signed Camera Extension, which needs a paid Apple Developer account. Until then, use OBS's built-in camera:")
+                    .size(12.5),
+            );
             ui.label("1. In OBS add a Browser source with the URL below (1280×720).");
             ui.label("2. Click Start Virtual Camera in OBS.");
             ui.label("3. Choose \"OBS Virtual Camera\" in Discord, Zoom, FaceTime, Chrome…");
         }
 
+        let s = &mut self.s;
         Self::section(ui, "Web stream (OBS · browser · other devices)");
         ui.checkbox(&mut s.stream_server, "Serve the output as a web stream");
         ui.add_enabled_ui(s.stream_server, |ui| {
@@ -844,6 +873,97 @@ impl GlyphApp {
         if let Some(e) = &st.stream_error {
             ui.label(RichText::new(e).color(Color32::from_rgb(255, 120, 90)));
         }
+    }
+
+    /// Windows 11 camera status + setup (needed for Discord).
+    #[cfg(windows)]
+    fn system_camera_ui(&mut self, ui: &mut egui::Ui) {
+        ui.label(
+            RichText::new(
+                "Windows 11 camera (Discord, Teams, Windows Camera, and everything else)",
+            )
+            .strong()
+            .size(13.0),
+        );
+        let job = self.mf_job.lock().clone();
+        if let Some(Some(res)) = &job {
+            match res {
+                Ok(()) => {
+                    self.toast = Some((
+                        "Windows 11 camera ready. Restart Discord to see it.".into(),
+                        Instant::now(),
+                    ))
+                }
+                Err(e) => self.toast = Some((format!("Camera setup: {e}"), Instant::now())),
+            }
+            *self.mf_job.lock() = None;
+            self.mf_status = crate::mfcam::status();
+        }
+        let busy = matches!(job, Some(None));
+        let st = &self.mf_status;
+        if !st.supported {
+            ui.label(
+                RichText::new("Needs Windows 11. On Windows 10, use the classic camera below.")
+                    .color(MUTED)
+                    .size(12.0),
+            );
+            return;
+        }
+        if st.up_to_date() {
+            ui.label(
+                RichText::new(format!(
+                    "✔ Installed: pick \"{}\" in Discord's Video settings",
+                    crate::mfcam::CAMERA_NAME
+                ))
+                .color(ACCENT),
+            );
+            ui.label(
+                RichText::new("Windows may show it as \"glyphcam (Windows Virtual Camera)\".")
+                    .color(MUTED)
+                    .size(12.0),
+            );
+        } else if st.installed() {
+            ui.label(
+                RichText::new("An older version is installed; update it to match this build.")
+                    .color(Color32::from_rgb(255, 190, 90)),
+            );
+        } else {
+            ui.label(
+                RichText::new("Not set up yet. Discord only lists this kind of camera.")
+                    .color(Color32::from_rgb(255, 190, 90)),
+            );
+        }
+        ui.horizontal(|ui| {
+            let label = if busy {
+                "Setting up…"
+            } else if st.up_to_date() {
+                "Repair"
+            } else if st.installed() {
+                "Update (asks for admin once)"
+            } else {
+                "Set up (asks for admin once)"
+            };
+            if ui.add_enabled(!busy, egui::Button::new(label)).clicked() {
+                *self.mf_job.lock() = Some(None);
+                let job = self.mf_job.clone();
+                let ctx = ui.ctx().clone();
+                std::thread::spawn(move || {
+                    let r = crate::mfcam::setup().map_err(|e| format!("{e:#}"));
+                    *job.lock() = Some(Some(r));
+                    ctx.request_repaint();
+                });
+            }
+            if st.installed() && !busy && ui.button("Remove").clicked() {
+                *self.mf_job.lock() = Some(None);
+                let job = self.mf_job.clone();
+                let ctx = ui.ctx().clone();
+                std::thread::spawn(move || {
+                    crate::mfcam::teardown();
+                    *job.lock() = Some(Some(Ok(())));
+                    ctx.request_repaint();
+                });
+            }
+        });
     }
 
     /// Copy/paste the whole look between machines.
@@ -1145,7 +1265,16 @@ impl GlyphApp {
                 } else {
                     "ready: pick \"glyphcam\" in any app".to_string()
                 };
-                if Self::big_toggle(ui, self.s.vcam_enabled, "Virtual camera", &vcam_sub) {
+                if Self::big_toggle(
+                    ui,
+                    self.s.vcam_enabled,
+                    if cfg!(windows) {
+                        "Virtual camera"
+                    } else {
+                        "Output"
+                    },
+                    &vcam_sub,
+                ) {
                     self.s.vcam_enabled = !self.s.vcam_enabled;
                 }
                 ui.add_space(12.0);
@@ -1267,6 +1396,18 @@ impl eframe::App for GlyphApp {
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let st = self.sh.status.lock().clone();
+                    #[cfg(windows)]
+                    if self.mf_status.supported && !self.mf_status.up_to_date() {
+                        if ui
+                            .button(
+                                RichText::new("⚠ Set up the Windows 11 camera for Discord")
+                                    .color(Color32::from_rgb(255, 190, 90)),
+                            )
+                            .clicked()
+                        {
+                            self.tab = Tab::Output;
+                        }
+                    }
                     if let Some(u) = &update {
                         if ui
                             .button(

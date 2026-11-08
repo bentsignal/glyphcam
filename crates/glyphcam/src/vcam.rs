@@ -7,8 +7,16 @@ use glyphcam_core::Frame;
 pub use glyphcam_shm::WriterState;
 
 pub struct VcamOutput {
+    /// Per-session mapping read by the DirectShow filter.
     #[cfg(windows)]
     map: Option<glyphcam_shm::win::SharedMapping>,
+    /// Machine-wide mapping read by the Windows 11 camera source. It only
+    /// exists once the Frame Server has loaded the source, so we poll for it.
+    #[cfg(windows)]
+    global: std::cell::RefCell<(
+        Option<glyphcam_shm::win::SharedMapping>,
+        Option<std::time::Instant>,
+    )>,
 }
 
 impl VcamOutput {
@@ -22,32 +30,56 @@ impl VcamOutput {
                     None
                 }
             };
-            VcamOutput { map }
+            VcamOutput {
+                map,
+                global: std::cell::RefCell::new((None, None)),
+            }
         }
         #[cfg(not(windows))]
         VcamOutput {}
     }
 
+    /// Run `f` on every mapping that exists.
+    #[cfg(windows)]
+    fn each(&self, mut f: impl FnMut(&glyphcam_shm::Region)) {
+        if let Some(m) = &self.map {
+            f(m.region());
+        }
+        let mut g = self.global.borrow_mut();
+        if g.0.is_none()
+            && g.1
+                .is_none_or(|t| t.elapsed() > std::time::Duration::from_millis(250))
+        {
+            g.1 = Some(std::time::Instant::now());
+            if let Ok(m) = glyphcam_shm::win::SharedMapping::open_global() {
+                log::info!("Windows 11 camera connected");
+                g.0 = Some(m);
+            }
+        }
+        if let Some(m) = &g.0 {
+            f(m.region());
+        }
+    }
+
     pub fn set_state(&self, _s: WriterState) {
         #[cfg(windows)]
-        if let Some(m) = &self.map {
-            m.region().set_state(_s);
-        }
+        self.each(|r| r.set_state(_s));
     }
 
     pub fn write(&self, _f: &Frame) {
         #[cfg(windows)]
-        if let Some(m) = &self.map {
-            m.region().write_frame(_f.width, _f.height, &_f.data);
-        }
+        self.each(|r| r.write_frame(_f.width, _f.height, &_f.data));
     }
 
-    /// An app has the camera open and is pulling frames right now.
+    /// An app has one of the cameras open and is pulling frames right now.
     pub fn consumer_active(&self) -> bool {
         #[cfg(windows)]
-        if let Some(m) = &self.map {
-            return m.region().reader_idle_ms() < 1500;
+        {
+            let mut active = false;
+            self.each(|r| active |= r.reader_idle_ms() < 1500);
+            return active;
         }
+        #[allow(unreachable_code)]
         false
     }
 }

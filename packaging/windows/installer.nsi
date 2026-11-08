@@ -97,6 +97,7 @@ Section "glyphcam" SecMain
   SetOverwrite try
   File "${SRCDIR}\glyphcam-vcam-x64.dll"
   File "${SRCDIR}\glyphcam-vcam-x86.dll"
+  File "${SRCDIR}\glyphcam-mfcam.dll"
   SetOverwrite on
 
   ; Remove older DLL folders that aren't in use (in-use ones fail silently).
@@ -146,6 +147,9 @@ SectionEnd
 
 Section "Uninstall"
   Call un.StopApp
+  ; Windows 11 camera: removes the per-user camera; asks for admin to
+  ; remove the machine-wide part if it was set up.
+  nsExec::ExecToLog '"$INSTDIR\glyphcam.exe" --remove-system-camera'
   nsExec::ExecToLog '"$INSTDIR\glyphcam.exe" --unregister-vcam'
   DeleteRegValue HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "glyphcam"
   Delete "$SMPROGRAMS\glyphcam.lnk"

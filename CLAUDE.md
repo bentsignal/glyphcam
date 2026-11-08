@@ -9,6 +9,7 @@ Real-time glyph-art face camera with a virtual webcam. Rust workspace, Windows +
 | `crates/glyphcam-core` | Pipeline (no platform code): `track.rs` (BlazeFace detection + selfie segmentation via `tract`, on a worker thread), `stabilize.rs` (spring-damper "view model" rig with a hard clamp so the face never leaves the frame), `render.rs` (cell sampling, exposure, depth shading from a fitted head ellipsoid, digital rain, glyph-atlas blit into BGRA), `glyphs.rs` (font rasterization into a density-sorted atlas), `color.rs`, `settings.rs`, `source.rs` (Demo + Image test sources). |
 | `crates/glyphcam-shm` | Shared-memory frame protocol (`Local\glyphcam-vcam-v1`, 3 seqlocked BGRA slots, heartbeats both ways) + Windows per-user COM registration of the filter (`win.rs`). The layout must stay identical for 32/64-bit. Bump `VERSION` + mapping name on any change. |
 | `crates/glyphcam-vcam-dshow` | `glyphcam_vcam.dll`: DirectShow source filter loaded *inside* Discord/Zoom/OBS/browsers. Reads the shared memory and converts to YUY2/NV12/I420/RGB24/RGB32 at 4 sizes. It shows a placeholder card when the app isn't feeding frames. The vtable is patched so `GetState` returns `VFW_S_CANT_CUE` (live source). |
+| `crates/glyphcam-vcam-mf` | `glyphcam_mfcam.dll`: Windows 11 Media Foundation virtual camera source (`IMFActivate` → `IMFMediaSourceEx` + `IMFMediaStream2`, ported from smourier/VCamSample). The Frame Server service loads it (session 0, LOCAL SERVICE), so it must be registered in **HKLM** and live in `%ProgramFiles%\glyphcam\camera\p<proto>-<build>\`. The app does that via an elevated `--install-system-camera` and creates the camera itself with `MFCreateVirtualCamera` (system lifetime, current user; no admin). Frames come through `Global\glyphcam-mf-v1`, which the source creates and the app polls for (`OpenFileMapping`). **Discord only sees this camera** (it enumerates via Media Foundation). |
 | `crates/glyphcam` | The app: `engine.rs` (demand-driven loop: the camera opens only when the preview, a vcam reader or a stream client wants frames, and lingers 20 s after; it wakes the UI on status changes so the tray tooltip stays current), `camera.rs` (nokhwa capture + own NV12/YUYV/MJPEG decode), `vcam.rs`, `stream.rs` (MJPEG server on port 8737; localhost only unless `stream_lan` is set, which binds 0.0.0.0 and lists LAN/Tailscale addresses), `share.rs` (copy/paste settings code `glyphcam1:<base64 json>` with an allowlist of look/framing keys), `ui.rs` (egui control panel), `tray.rs`, `updater.rs` (GitHub Releases build manager), `platform.rs` (single instance on 127.0.0.1:47380, autostart, macOS hide/show). |
 
 Models and fonts are embedded with `include_bytes!` from `assets/` (see THIRD-PARTY.md). Icons come from `packaging/icons/make_icons.py`.
@@ -24,6 +25,16 @@ target/release/glyphcam --register-vcam         # Windows: (re)register the filt
 target/release/glyphcam --install-release nightly   # run the updater non-interactively (download + install + relaunch)
 target/release/glyphcam --tab updates           # open on a given settings tab (screenshots)
 ```
+
+Windows 11 camera checks (after `glyphcam --setup-system-camera`, which shows one UAC prompt):
+```sh
+cargo run --release -p glyphcam-vcam-mf --example mf_list -- glyphcam   # Media Foundation (Discord-style) device list + grab a frame
+cargo run --release -p glyphcam-vcam-mf --example source_test           # drive the source in-process (no admin)
+cargo run --release -p glyphcam-shm --example global_probe              # is the Global mapping there? (needs a consumer streaming)
+ffmpeg -f dshow -i video="glyphcam (Windows Virtual Camera)" -frames:v 1 -update 1 out.png
+glyphcam --remove-system-camera                                         # remove (UAC prompt for the HKLM part)
+```
+Note: heredocs in this environment's bash halve backslashes, so write Rust/NSIS paths with the editor tools rather than shell heredocs.
 
 Browser check (Chromium path, covers Chrome/Edge/Teams/Meet): drive the installed Edge with Playwright
 (`p.chromium.launch(channel="msedge", args=["--use-fake-ui-for-media-stream"])`) on a page that calls

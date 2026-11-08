@@ -2031,7 +2031,7 @@ dependencies = [
 
 [[package]]
 name = "glyphcam"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "arboard",
@@ -2064,7 +2064,7 @@ dependencies = [
 
 [[package]]
 name = "glyphcam-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "fontdue",
@@ -2078,14 +2078,23 @@ dependencies = [
 
 [[package]]
 name = "glyphcam-shm"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "windows",
 ]
 
 [[package]]
 name = "glyphcam-vcam-dshow"
-version = "0.2.0"
+version = "0.3.0"
+dependencies = [
+ "glyphcam-shm",
+ "windows",
+ "windows-core",
+]
+
+[[package]]
+name = "glyphcam-vcam-mf"
+version = "0.3.0"
 dependencies = [
  "glyphcam-shm",
  "windows",

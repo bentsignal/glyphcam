@@ -17,9 +17,17 @@ Download the latest build from **[Releases](https://github.com/bentsignal/glyphc
 
 1. Run `glyphcam-<version>-windows-x64-setup.exe`. It installs per user, so you won't see an admin prompt.
    - SmartScreen may warn you because the installer isn't code-signed. Click **More info**, then **Run anyway**.
-2. In Discord, Zoom, OBS (*Video Capture Device*), Teams, Chrome, Edge or Firefox, choose the camera **glyphcam**. Restart apps that were already open so they see the new camera.
+2. **Windows 11: set up the Windows 11 camera once.** Click the banner in glyphcam, or **Output → Windows 11 camera → Set up**, and approve the one administrator prompt. **Discord needs this camera.** Discord, Teams and the Windows Camera app only list Windows 11-style cameras.
+3. In your app, choose **glyphcam** as the camera:
+   - In Discord it may appear as **glyphcam (Windows Virtual Camera)**.
+   - It also works in Zoom, OBS (*Video Capture Device*), Teams, Chrome, Edge and Firefox.
+   - Restart apps that were already open so they see the new camera.
 
-The virtual camera is a DirectShow source filter, registered for your user, in both 64-bit and 32-bit versions. When glyphcam isn't running, the camera shows a "glyphcam is not running" card instead of failing.
+glyphcam installs two cameras:
+- **Windows 11 camera:** a Media Foundation virtual camera, used by every app on Windows 11. The admin prompt is needed because Windows only loads camera components that are registered machine-wide.
+- **Classic camera:** a DirectShow filter registered for your user, 64- and 32-bit. It's for OBS, Zoom and browsers on Windows 10.
+
+When glyphcam isn't running, both show a "glyphcam is not running" card instead of failing.
 
 ### macOS 11+ (universal: Apple Silicon and Intel)
 

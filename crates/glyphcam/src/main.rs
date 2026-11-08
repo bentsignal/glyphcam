@@ -4,6 +4,8 @@
 mod camera;
 mod config;
 mod engine;
+#[cfg(windows)]
+mod mfcam;
 mod platform;
 mod share;
 mod stream;
@@ -17,10 +19,14 @@ use std::io::Write;
 use std::sync::Arc;
 
 fn init_logging() {
+    init_logging_to("glyphcam.log");
+}
+
+fn init_logging_to(file: &str) {
     let dir = config::log_dir();
     let _ = std::fs::create_dir_all(&dir);
-    let path = dir.join("glyphcam.log");
-    let _ = std::fs::rename(&path, dir.join("glyphcam.old.log"));
+    let path = dir.join(file);
+    let _ = std::fs::rename(&path, path.with_extension("old.log"));
     let mut b = env_logger::Builder::from_env(
         env_logger::Env::default().default_filter_or("info,wgpu=warn,eframe=warn"),
     );
@@ -108,6 +114,8 @@ fn main() {
         || has("--unregister-vcam")
         || has("--version")
         || has("--install-release")
+        || has("--install-system-camera")
+        || has("--remove-system-camera")
     {
         attach_console();
     }
@@ -145,6 +153,43 @@ fn main() {
             }
             return;
         }
+        if has("--install-system-camera") {
+            // Elevated helper: copy + register the Windows 11 camera source.
+            init_logging_to("system-camera.log");
+            match mfcam::install_admin() {
+                Ok(p) => {
+                    log::info!("system camera installed: {}", p.display());
+                    println!("system camera installed: {}", p.display());
+                }
+                Err(e) => {
+                    log::error!("system camera install failed: {e:#}");
+                    eprintln!("system camera install failed: {e:#}");
+                    std::process::exit(1);
+                }
+            }
+            return;
+        }
+        if has("--uninstall-system-camera-admin") {
+            mfcam::uninstall_admin();
+            return;
+        }
+        if has("--setup-system-camera") {
+            // Non-elevated: runs the admin step (UAC) if needed, then creates the camera.
+            attach_console();
+            match mfcam::setup() {
+                Ok(()) => println!("system camera ready"),
+                Err(e) => {
+                    eprintln!("system camera setup failed: {e:#}");
+                    std::process::exit(1);
+                }
+            }
+            return;
+        }
+        if has("--remove-system-camera") {
+            mfcam::teardown();
+            println!("system camera removed");
+            return;
+        }
         if has("--unregister-vcam") {
             vcam::install::unregister();
             println!("virtual camera unregistered");
@@ -166,8 +211,19 @@ fn main() {
     };
 
     #[cfg(windows)]
-    if let Err(e) = vcam::install::ensure_registered() {
-        log::warn!("virtual camera registration: {e:#}");
+    {
+        if let Err(e) = vcam::install::ensure_registered() {
+            log::warn!("virtual camera registration: {e:#}");
+        }
+        // Make sure the Windows 11 camera exists for this user (cheap, no admin).
+        std::thread::spawn(|| {
+            if mfcam::status().installed() {
+                match mfcam::ensure_camera() {
+                    Ok(()) => log::info!("Windows 11 camera ready"),
+                    Err(e) => log::warn!("Windows 11 camera: {e:#}"),
+                }
+            }
+        });
     }
     camera::init_permissions();
 

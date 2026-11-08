@@ -24,6 +24,12 @@ pub const TOTAL_SIZE: usize = HEADER_SIZE + SLOT_SIZE * BUFFERS;
 
 /// Per-session name; consumer apps run in the same session as glyphcam.
 pub const MAPPING_NAME: &str = "Local\\glyphcam-vcam-v1";
+/// Machine-wide name used by the Windows 11 (Media Foundation) camera,
+/// whose source runs inside the Frame Server service in session 0. Only
+/// the service can create it; the app opens it once it exists.
+pub const MF_MAPPING_NAME: &str = "Global\\glyphcam-mf-v1";
+/// CLSID of the Media Foundation virtual camera source.
+pub const MF_SOURCE_CLSID: &str = "{6F1E8A52-3C7D-4B9E-A1F0-5D2C8E4B7A93}";
 
 /// Display name of the virtual camera.
 pub const CAMERA_NAME: &str = "glyphcam";
@@ -221,6 +227,7 @@ impl Region {
     }
 }
 
+pub mod placeholder;
 #[cfg(windows)]
 pub mod win;
 

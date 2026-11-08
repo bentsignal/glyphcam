@@ -208,6 +208,8 @@ pub struct Settings {
     pub source: SourceKind,
     /// Mirror horizontally (selfie view).
     pub mirror: bool,
+    /// Preferred capture height (480 = light, 720 = sharper).
+    pub camera_quality: u32,
 
     // --- output ---
     pub out_width: u32,
@@ -272,6 +274,7 @@ impl Default for Settings {
         Self {
             source: SourceKind::Camera(None),
             mirror: true,
+            camera_quality: 480,
             out_width: 1280,
             out_height: 720,
             fps: 30,
@@ -324,6 +327,7 @@ impl Settings {
         self.out_width = w;
         self.out_height = h;
         self.fps = self.fps.clamp(10, 60);
+        self.camera_quality = if self.camera_quality >= 720 { 720 } else { 480 };
         self.columns = self.columns.clamp(32, 320);
         self.contrast = self.contrast.clamp(0.2, 3.0);
         self.brightness = self.brightness.clamp(-1.0, 1.0);

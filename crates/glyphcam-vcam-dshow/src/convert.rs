@@ -133,10 +133,10 @@ mod tests {
 
     #[test]
     fn white_is_white_in_yuv() {
-        let src = vec![255u8; 4 * 4 * 4];
+        let src = vec![255u8; 16 * 9 * 4];
         let f = Fmt::new(Pix::Yuy2, 640, 360);
         let mut dst = vec![0u8; f.image_size()];
-        convert(&src, 4, 4, &f, &mut dst);
+        convert(&src, 16, 9, &f, &mut dst);
         assert_eq!(dst[0], 235);
         assert_eq!(dst[1], 128);
     }

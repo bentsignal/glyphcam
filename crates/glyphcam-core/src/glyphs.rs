@@ -179,8 +179,16 @@ impl Atlas {
         }
 
         // Normalize densities and bucket into levels.
-        let dmax = density.iter().cloned().fold(0.0f32, f32::max).max(1e-6);
-        let norm: Vec<f32> = density.iter().map(|d| d / dmax).collect();
+        // Normalize to the 92nd percentile so the densest few glyphs don't
+        // monopolize the brightest levels (more variety up top).
+        let mut sorted: Vec<f32> = density.iter().skip(1).cloned().collect();
+        sorted.sort_by(|a, b| a.total_cmp(b));
+        let dmax = sorted
+            .get((sorted.len() as f32 * 0.92) as usize)
+            .copied()
+            .unwrap_or(1.0)
+            .max(1e-6);
+        let norm: Vec<f32> = density.iter().map(|d| (d / dmax).min(1.0)).collect();
         let mut levels = Vec::with_capacity(LEVELS);
         for l in 0..LEVELS {
             let t = l as f32 / (LEVELS - 1) as f32;

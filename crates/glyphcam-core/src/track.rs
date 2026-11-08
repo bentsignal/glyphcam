@@ -288,6 +288,7 @@ impl Tracker {
                 let mut prev: Option<Face> = None;
                 let mut mask_smooth: Option<Mask> = None;
                 let mut n: u64 = 0;
+                let mut lost_frames: u32 = 0;
                 loop {
                     let img = {
                         let mut p = sh.pending.lock();
@@ -300,24 +301,41 @@ impl Tracker {
                         p.take().unwrap()
                     };
                     n += 1;
-                    let t0 = Instant::now();
-                    let faces = det.detect(&img, 0.55).unwrap_or_default();
-                    let detect_ms = t0.elapsed().as_secs_f32() * 1000.0;
-                    let face = pick_face(&faces, prev.as_ref());
-                    if face.is_some() {
-                        prev = face;
+                    // Alternate detection and segmentation to halve CPU; when
+                    // the face is lost, detect every frame to reacquire fast.
+                    let want_mask = sh.want_mask.load(Ordering::Relaxed);
+                    let searching = prev.is_none() || lost_frames > 0;
+                    // 30 fps input -> detection ~15 Hz, mask ~10 Hz.
+                    let phase = n % 6;
+                    let do_detect =
+                        matches!(phase, 0 | 2 | 4) || (!want_mask && !searching && phase != 3);
+                    let do_mask = want_mask && matches!(phase, 1 | 5);
+                    let mut face = None;
+                    let mut detect_ms = None;
+                    if do_detect {
+                        let t0 = Instant::now();
+                        let faces = det.detect(&img, 0.55).unwrap_or_default();
+                        detect_ms = Some(t0.elapsed().as_secs_f32() * 1000.0);
+                        face = pick_face(&faces, prev.as_ref());
+                        if face.is_some() {
+                            prev = face;
+                            lost_frames = 0;
+                        } else {
+                            lost_frames += 1;
+                            if lost_frames > 30 {
+                                prev = None;
+                            }
+                        }
                     }
-                    // Segmentation every other frame keeps CPU low; the mask
-                    // is temporally smoothed so it doesn't flicker.
                     let mut segment_ms = None;
-                    if sh.want_mask.load(Ordering::Relaxed) && n % 2 == 0 {
+                    if do_mask {
                         let t1 = Instant::now();
                         if let Ok(m) = seg.segment(&img) {
                             segment_ms = Some(t1.elapsed().as_secs_f32() * 1000.0);
                             mask_smooth = Some(match mask_smooth.take() {
                                 Some(mut s) if s.w == m.w && s.h == m.h => {
                                     for (a, b) in s.data.iter_mut().zip(&m.data) {
-                                        *a = *a * 0.35 + b * 0.65;
+                                        *a = *a * 0.3 + b * 0.7;
                                     }
                                     s
                                 }
@@ -327,15 +345,17 @@ impl Tracker {
                     }
                     let mut st = sh.state.lock();
                     st.src_size = (img.width, img.height);
-                    st.detect_ms = detect_ms;
-                    if let Some(f) = face {
-                        st.face = Some(f);
-                        st.face_time = Some(Instant::now());
-                    } else if st
-                        .face_time
-                        .is_some_and(|t| t.elapsed() > Duration::from_millis(400))
-                    {
-                        st.face = None;
+                    if let Some(ms) = detect_ms {
+                        st.detect_ms = ms;
+                        if let Some(f) = face {
+                            st.face = Some(f);
+                            st.face_time = Some(Instant::now());
+                        } else if st
+                            .face_time
+                            .is_none_or(|t| t.elapsed() > Duration::from_millis(400))
+                        {
+                            st.face = None;
+                        }
                     }
                     if let Some(ms) = segment_ms {
                         st.segment_ms = ms;

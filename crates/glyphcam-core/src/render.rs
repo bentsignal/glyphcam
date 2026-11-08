@@ -529,9 +529,17 @@ impl Renderer {
                 let row = &mut data[(y * w + ox) * 4..(y * w + ox + cols * cw) * 4];
                 for gx in 0..cols {
                     let i = gy * cols + gx;
+                    let b = self.bg[i];
+                    if self.glyph_idx[i] == 0 {
+                        // blank cell: flat background
+                        let px = [b[2], b[1], b[0], 255];
+                        for d in row[gx * cw * 4..(gx + 1) * cw * 4].chunks_exact_mut(4) {
+                            d.copy_from_slice(&px);
+                        }
+                        continue;
+                    }
                     let bmp = &atlas.glyph(self.glyph_idx[i])[py * cw..(py + 1) * cw];
                     let f = self.fg[i];
-                    let b = self.bg[i];
                     let (fb, fgc, fr) = (f[2] as i32, f[1] as i32, f[0] as i32);
                     let (bb, bgg, br) = (b[2] as i32, b[1] as i32, b[0] as i32);
                     let dst = &mut row[gx * cw * 4..(gx + 1) * cw * 4];

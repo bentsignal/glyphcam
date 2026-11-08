@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleName</key><string>glyphcam</string>
+  <key>CFBundleDisplayName</key><string>glyphcam</string>
+  <key>CFBundleIdentifier</key><string>dev.bentsignal.glyphcam</string>
+  <key>CFBundleExecutable</key><string>glyphcam</string>
+  <key>CFBundleIconFile</key><string>glyphcam</string>
+  <key>CFBundlePackageType</key><string>APPL</string>
+  <key>CFBundleShortVersionString</key><string>@VERSION@</string>
+  <key>CFBundleVersion</key><string>@VERSION@</string>
+  <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+  <key>GlyphcamBuild</key><string>@BUILD@</string>
+  <key>LSMinimumSystemVersion</key><string>11.0</string>
+  <key>LSApplicationCategoryType</key><string>public.app-category.video</string>
+  <key>NSHighResolutionCapable</key><true/>
+  <key>NSSupportsAutomaticGraphicsSwitching</key><true/>
+  <key>NSCameraUsageDescription</key><string>glyphcam turns your camera feed into live glyph art.</string>
+  <key>NSHumanReadableCopyright</key><string>MIT License</string>
+</dict>
+</plist>

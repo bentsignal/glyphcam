@@ -1,0 +1,102 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  windows:
+    name: Windows (x64 + x86 camera DLL)
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc,i686-pc-windows-msvc
+      - uses: Swatinem/rust-cache@v2
+      - name: Build metadata
+        run: scripts/ci-env.sh >> "$GITHUB_ENV"
+      - name: Install NSIS
+        run: |
+          if ! command -v makensis >/dev/null; then
+            choco install nsis -y --no-progress
+          fi
+          for p in "$(command -v makensis || true)" "/c/Program Files (x86)/NSIS/makensis.exe" "/c/Program Files/NSIS/makensis.exe"; do
+            if [ -n "$p" ] && [ -x "$p" ]; then echo "MAKENSIS=$p" >> "$GITHUB_ENV"; break; fi
+          done
+      - name: Test
+        run: cargo test --release --locked --workspace
+      - name: Package
+        run: scripts/package-windows.sh
+      - name: Smoke test
+        run: |
+          dist/stage/glyphcam.exe --version
+          dist/stage/glyphcam.exe --selftest dist/selftest-windows.png
+      - uses: actions/upload-artifact@v5
+        with:
+          name: windows
+          path: |
+            dist/*.exe
+            dist/selftest-windows.png
+          if-no-files-found: error
+
+  macos:
+    name: macOS (universal)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+      - name: Build metadata
+        run: scripts/ci-env.sh >> "$GITHUB_ENV"
+      - name: Test
+        run: cargo test --release --locked --workspace --target aarch64-apple-darwin
+      - name: Package
+        run: scripts/package-macos.sh
+      - name: Smoke test
+        run: dist/glyphcam.app/Contents/MacOS/glyphcam --selftest dist/selftest-macos.png
+      - uses: actions/upload-artifact@v5
+        with:
+          name: macos
+          path: |
+            dist/*.dmg
+            dist/*.app.zip
+            dist/selftest-macos.png
+          if-no-files-found: error
+
+  publish:
+    name: Publish release
+    needs: [windows, macos]
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@v5
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Publish
+        run: scripts/publish-release.sh artifacts

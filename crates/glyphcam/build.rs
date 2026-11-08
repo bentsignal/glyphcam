@@ -14,6 +14,13 @@ fn main() {
     let channel = std::env::var("GLYPHCAM_CHANNEL").unwrap_or_else(|_| "dev".into());
     println!("cargo:rustc-env=GLYPHCAM_CHANNEL={channel}");
     println!("cargo:rerun-if-env-changed=GLYPHCAM_BUILD_SHA");
+    // refresh the embedded commit hash in local builds
+    println!("cargo:rerun-if-changed=../../.git/HEAD");
+    if let Ok(head) = std::fs::read_to_string("../../.git/HEAD") {
+        if let Some(r) = head.strip_prefix("ref: ") {
+            println!("cargo:rerun-if-changed=../../.git/{}", r.trim());
+        }
+    }
     println!("cargo:rerun-if-env-changed=GLYPHCAM_CHANNEL");
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
         println!("cargo:rerun-if-changed=../../packaging/windows/glyphcam.rc");

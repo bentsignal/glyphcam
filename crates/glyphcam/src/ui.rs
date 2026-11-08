@@ -61,6 +61,8 @@ pub struct Launch {
     pub sh: Arc<Shared>,
     pub engine: std::thread::JoinHandle<()>,
     pub start_hidden: bool,
+    /// Initial settings tab (dev/screenshot helper: --tab updates).
+    pub initial_tab: Option<String>,
     pub cmd_tx: Sender<TrayCmd>,
     pub cmd_rx: Receiver<TrayCmd>,
 }
@@ -126,7 +128,14 @@ impl GlyphApp {
             dirty_since: None,
             tex: None,
             tex_seq: 0,
-            tab: Tab::Look,
+            tab: match l.initial_tab.as_deref() {
+                Some("framing") => Tab::Framing,
+                Some("camera") => Tab::Camera,
+                Some("output") => Tab::Output,
+                Some("app") => Tab::App,
+                Some("updates") => Tab::Updates,
+                _ => Tab::Look,
+            },
             visible: true,
             quitting: false,
             tray,
@@ -1092,6 +1101,11 @@ impl eframe::App for GlyphApp {
             }
         }
 
+        // On macOS "hidden" is app-level (Cmd-H / Dock click unhides it).
+        #[cfg(target_os = "macos")]
+        {
+            self.visible = !crate::platform::macos_is_hidden();
+        }
         let minimized = ctx.input(|i| i.viewport().minimized.unwrap_or(false));
         let wanted = self.visible && !minimized && self.s.preview;
         self.sh.preview_wanted.store(wanted, Ordering::Relaxed);

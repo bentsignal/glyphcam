@@ -233,7 +233,7 @@ fn sanitize(s: &str) -> String {
         .collect()
 }
 
-fn fetch_releases() -> anyhow::Result<Vec<Release>> {
+pub fn fetch_releases() -> anyhow::Result<Vec<Release>> {
     let url = format!("https://api.github.com/repos/{REPO}/releases?per_page=40");
     let mut resp = agent()
         .get(&url)
@@ -344,3 +344,24 @@ fn launch_installer(_file: &Path) -> anyhow::Result<()> {
 
 #[allow(dead_code)]
 fn _unused(_: PathBuf) {}
+
+/// Non-interactive install of a release by tag (CLI: `--install-release <tag>`).
+/// Same path as the Install button; used to test the updater end to end.
+pub fn install_blocking(tag: &str) -> anyhow::Result<()> {
+    let list = fetch_releases()?;
+    let rel = list
+        .into_iter()
+        .find(|r| r.tag_name == tag)
+        .ok_or_else(|| anyhow::anyhow!("no release tagged {tag}"))?;
+    let asset = rel
+        .platform_asset()
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("{tag} has no build for this platform"))?;
+    let dir = config::cache_dir().join("downloads");
+    std::fs::create_dir_all(&dir)?;
+    let file = dir.join(format!("{}-{}", sanitize(tag), asset.name));
+    println!("downloading {} ({} bytes)", asset.name, asset.size);
+    download(&asset.browser_download_url, &file, |_, _| {})?;
+    println!("launching installer {}", file.display());
+    launch_installer(&file)
+}

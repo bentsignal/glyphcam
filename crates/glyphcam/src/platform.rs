@@ -95,6 +95,16 @@ pub fn macos_hide() {
 }
 
 #[cfg(target_os = "macos")]
+pub fn macos_is_hidden() -> bool {
+    use objc2::MainThreadMarker;
+    use objc2_app_kit::NSApplication;
+    match MainThreadMarker::new() {
+        Some(mtm) => NSApplication::sharedApplication(mtm).isHidden(),
+        None => false,
+    }
+}
+
+#[cfg(target_os = "macos")]
 pub fn macos_show() {
     use objc2::MainThreadMarker;
     use objc2_app_kit::NSApplication;

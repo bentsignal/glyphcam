@@ -102,7 +102,12 @@ fn main() {
             .map(String::as_str)
     };
 
-    if has("--selftest") || has("--register-vcam") || has("--unregister-vcam") || has("--version") {
+    if has("--selftest")
+        || has("--register-vcam")
+        || has("--unregister-vcam")
+        || has("--version")
+        || has("--install-release")
+    {
         attach_console();
     }
     if has("--version") {
@@ -114,6 +119,15 @@ fn main() {
             Ok(()) => std::process::exit(0),
             Err(e) => {
                 eprintln!("selftest failed: {e:#}");
+                std::process::exit(1);
+            }
+        }
+    }
+    if let Some(tag) = arg_after("--install-release") {
+        match updater::install_blocking(tag) {
+            Ok(()) => std::process::exit(0),
+            Err(e) => {
+                eprintln!("install failed: {e:#}");
                 std::process::exit(1);
             }
         }
@@ -178,7 +192,7 @@ fn main() {
         .with_app_id("glyphcam")
         .with_inner_size([1080.0, 720.0])
         .with_min_inner_size([780.0, 540.0])
-        .with_visible(!start_hidden);
+        .with_visible(!start_hidden || cfg!(target_os = "macos"));
     if let Some(icon) = icon {
         viewport = viewport.with_icon(icon);
     }
@@ -200,6 +214,7 @@ fn main() {
         sh,
         engine,
         start_hidden,
+        initial_tab: arg_after("--tab").map(str::to_owned),
         cmd_tx,
         cmd_rx,
     };

@@ -106,7 +106,25 @@ pub fn families(s: &Scripts) -> Vec<Family> {
 pub fn sample_text(s: &Scripts, n: usize) -> String {
     let mut out = String::new();
     let fams = families(s);
-    let lists: Vec<Vec<char>> = fams.iter().map(|&f| chars_for(f)).collect();
+    let f = fonts();
+    let lists: Vec<Vec<char>> = fams
+        .iter()
+        .map(|&fam| {
+            let font = match fam {
+                Family::Katakana => &f.kana,
+                Family::Braille => &f.braille,
+                _ => &f.mono,
+            };
+            chars_for(fam)
+                .into_iter()
+                .filter(|&c| font.lookup_glyph_index(c) != 0)
+                .collect::<Vec<_>>()
+        })
+        .filter(|l: &Vec<char>| !l.is_empty())
+        .collect();
+    if lists.is_empty() {
+        return String::new();
+    }
     let mut i = 0usize;
     while out.chars().count() < n {
         let l = &lists[i % lists.len()];

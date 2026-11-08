@@ -21,7 +21,13 @@ cargo test --workspace --release
 cargo run -p glyphcam-core --release --example render_test -- <image.jpg|demo> <outdir>   # PNG snapshots, timings
 target/release/glyphcam --selftest out.png      # headless pipeline check (used in CI)
 target/release/glyphcam --register-vcam         # Windows: (re)register the filter for this user
+target/release/glyphcam --install-release nightly   # run the updater non-interactively (download + install + relaunch)
+target/release/glyphcam --tab updates           # open on a given settings tab (screenshots)
 ```
+
+Browser check (Chromium path, covers Chrome/Edge/Teams/Meet): drive the installed Edge with Playwright
+(`p.chromium.launch(channel="msedge", args=["--use-fake-ui-for-media-stream"])`) on a page that calls
+`enumerateDevices()` and draws a frame from the "glyphcam" device.
 
 The `[profile.dev.package."*"] opt-level = 3` setting keeps inference usable in debug builds. Workspace crates themselves stay unoptimized in dev, so the DLL is slow in debug; test virtual-camera throughput with `--release`.
 
@@ -36,7 +42,7 @@ cargo run --release -p glyphcam-shm --example write_test 20 &   # test pattern w
 ffmpeg -f dshow -pixel_format bgr24 -video_size 640x360 -i video=glyphcam -frames:v 5 -update 1 out.png
 ```
 
-The dev machine has no physical webcam. It does have an MF virtual camera ("N-LOG"), which nokhwa can open; it sends ~170 fps of black frames. Use the Demo / Image sources to see the face pipeline.
+The dev machine has no physical webcam. Its "N-LOG" camera is the user's own in-development app: don't use it for testing. Use the Demo / Image sources (and `write_test` for the filter) instead. "Automatic" camera selection skips names that look virtual.
 
 ## Packaging & releases
 
@@ -65,5 +71,8 @@ Verified on the Windows build machine:
 - Per-user registration works, and the 32-bit DLL loads (SysWOW64 regsvr32).
 - Install, uninstall and silent install all work.
 - App → virtual camera → consumer chain, demand-driven camera start, MJPEG server, and the core pipeline on a real photo.
+- Microsoft Edge (Chromium) lists and streams the camera at 1280×720 / 30 fps.
+- The CI-built nightly installer, and the in-app updater installing it (download, silent install, re-registration, relaunch).
+- macOS CI: universal build, and `--selftest` passes on arm64 and on x86_64 under Rosetta.
 
-Not verified here: a physical webcam, Discord/Zoom/OBS UIs, anything on macOS beyond CI build plus `--selftest`, the tray on macOS, and the updater installing a newer build (no newer release existed at the time).
+Not verified here: a physical webcam, the Discord/Zoom/OBS UIs, anything interactive on macOS (window, tray, camera permission, AVFoundation capture), and the macOS updater swap.

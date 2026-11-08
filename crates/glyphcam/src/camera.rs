@@ -43,6 +43,21 @@ pub fn list() -> Vec<CameraDevice> {
     }
 }
 
+/// Heuristic for software cameras (other apps' outputs) that "Automatic"
+/// should not pick when a real webcam exists.
+pub fn looks_virtual(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    ["virtual", "obs", "snap camera", "xsplit", "manycam", "droidcam", "epoccam", "camo", "nvidia broadcast", "n-log"]
+        .iter()
+        .any(|k| n.contains(k))
+}
+
+/// Default camera when the user hasn't picked one: first physical camera,
+/// falling back to whatever exists.
+pub fn preferred_default(cams: &[CameraDevice]) -> Option<CameraDevice> {
+    cams.iter().find(|c| !looks_virtual(&c.name)).or_else(|| cams.first()).cloned()
+}
+
 /// Request camera permission early on macOS (no-op elsewhere).
 pub fn init_permissions() {
     #[cfg(target_os = "macos")]

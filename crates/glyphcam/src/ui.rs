@@ -576,14 +576,14 @@ impl GlyphApp {
             SourceKind::Camera(sel) => {
                 let label = sel
                     .clone()
-                    .unwrap_or_else(|| "Automatic (first camera)".into());
+                    .unwrap_or_else(|| "Automatic (prefer real webcam)".into());
                 ui.horizontal(|ui| {
                     ComboBox::from_id_salt("cam")
                         .selected_text(label)
                         .width(240.0)
                         .show_ui(ui, |ui| {
                             if ui
-                                .selectable_label(sel.is_none(), "Automatic (first camera)")
+                                .selectable_label(sel.is_none(), "Automatic (prefer real webcam)")
                                 .clicked()
                             {
                                 *sel = None;

@@ -87,7 +87,10 @@ pub fn macos_hide() {
     use objc2_app_kit::NSApplication;
     if let Some(mtm) = MainThreadMarker::new() {
         let app = NSApplication::sharedApplication(mtm);
-        app.hide(None);
+        #[allow(unused_unsafe)]
+        unsafe {
+            app.hide(None)
+        };
     }
 }
 
@@ -97,9 +100,11 @@ pub fn macos_show() {
     use objc2_app_kit::NSApplication;
     if let Some(mtm) = MainThreadMarker::new() {
         let app = NSApplication::sharedApplication(mtm);
-        app.unhide(None);
-        #[allow(deprecated)]
-        app.activateIgnoringOtherApps(true);
+        #[allow(unused_unsafe, deprecated)]
+        unsafe {
+            app.unhide(None);
+            app.activateIgnoringOtherApps(true);
+        }
     }
 }
 

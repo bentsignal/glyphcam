@@ -222,7 +222,7 @@ fn run(sh: Arc<Shared>) {
                             Some(n) => cams.iter().find(|c| &c.name == n).cloned(),
                             None => None,
                         }
-                        .or_else(|| cams.first().cloned());
+                        .or_else(|| camera::preferred_default(&cams));
                         match dev {
                             Some(dev) => {
                                 let cap = CaptureHandle::start(dev.clone(), s.camera_quality);

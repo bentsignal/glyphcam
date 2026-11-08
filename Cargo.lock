@@ -362,6 +362,11 @@ dependencies = [
 [[package]]
 name = "glyphcam-vcam-dshow"
 version = "0.1.0"
+dependencies = [
+ "glyphcam-shm",
+ "windows",
+ "windows-core",
+]
 
 [[package]]
 name = "half"

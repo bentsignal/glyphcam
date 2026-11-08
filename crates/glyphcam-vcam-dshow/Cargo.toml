@@ -1,9 +1,27 @@
 [package]
 name = "glyphcam-vcam-dshow"
+description = "glyphcam DirectShow virtual camera source filter (Windows)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish = false
 
 [lib]
+name = "glyphcam_vcam"
 crate-type = ["cdylib", "rlib"]
+
+[target.'cfg(windows)'.dependencies]
+glyphcam-shm.workspace = true
+windows-core.workspace = true
+windows = { workspace = true, features = [
+  "Win32_Foundation",
+  "Win32_Graphics_Gdi",
+  "Win32_Media",
+  "Win32_Media_DirectShow",
+  "Win32_Media_KernelStreaming",
+  "Win32_Media_MediaFoundation",
+  "Win32_System_Com",
+  "Win32_System_LibraryLoader",
+  "Win32_System_SystemServices",
+  "Win32_System_Threading",
+] }

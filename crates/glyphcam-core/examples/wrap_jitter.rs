@@ -44,6 +44,8 @@ fn main() -> anyhow::Result<()> {
         let warm = 30;
         let mut prev: Option<Vec<u8>> = None;
         let (mut sum, mut big, mut n) = (0.0f64, 0u64, 0u64);
+        // the torso (lower middle of the output), where clothes are
+        let (mut tsum, mut tn) = (0.0f64, 0u64);
         // cutout flicker: grid points whose person membership flips
         let mut prev_sub: Option<Vec<bool>> = None;
         let (mut flips, mut inside) = (0u64, 0u64);
@@ -79,11 +81,17 @@ fn main() -> anyhow::Result<()> {
             prev_sub = Some(sub);
             let rgb = p.frame().to_rgb();
             if let Some(pr) = &prev {
-                for (a, b) in rgb.iter().zip(pr) {
+                let (w, h) = (p.frame().width as usize, p.frame().height as usize);
+                for (k, (a, b)) in rgb.iter().zip(pr).enumerate() {
                     let d = (*a as i32 - *b as i32).unsigned_abs();
                     sum += d as f64;
                     big += (d > 64) as u64;
                     n += 1;
+                    let (x, y) = ((k / 3) % w, (k / 3) / w);
+                    if y > h * 6 / 10 && x > w / 4 && x < w * 3 / 4 {
+                        tsum += d as f64;
+                        tn += 1;
+                    }
                 }
             }
             if let Some(d) = out_dir {
@@ -101,8 +109,9 @@ fn main() -> anyhow::Result<()> {
             prev = Some(rgb);
         }
         println!(
-            "{name:18} mean_change={:.2}  big_changes={:.2}%  cutout_flips={:.2}%",
+            "{name:18} mean_change={:.2}  torso_change={:.2}  big_changes={:.2}%  cutout_flips={:.2}%",
             sum / n.max(1) as f64,
+            tsum / tn.max(1) as f64,
             100.0 * big as f64 / n.max(1) as f64,
             100.0 * flips as f64 / inside.max(1) as f64
         );

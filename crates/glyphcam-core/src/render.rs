@@ -48,6 +48,9 @@ struct Cell {
     alpha: f32,
     shade: f32,
     in_head: bool,
+    /// How much this cell is the head (0..1), a smooth ellipse around the
+    /// tracked face: picks face vs body exposure without a hard seam.
+    head_w: f32,
 }
 
 /// 3D head proxy (rotated ellipsoid + nose/eye features) built from the
@@ -172,6 +175,11 @@ pub struct Renderer {
     /// Exposure for the rest of the body (shirt, hoodie), which can be far
     /// darker or brighter than the face.
     body_exposure: (f32, f32),
+    /// Per-cell brightness with camera grain filtered out over time (only
+    /// where the picture holds still).
+    lum_s: Vec<f32>,
+    /// Face box (cx, cy, w, h) smoothed over a few frames.
+    face_s: Option<[f32; 4]>,
     cells: Vec<Cell>,
     inten: Vec<f32>,
     tmp: Vec<f32>,
@@ -226,6 +234,8 @@ impl Renderer {
             drops: Vec::new(),
             exposure: (0.0, 1.0),
             body_exposure: (0.0, 1.0),
+            lum_s: Vec::new(),
+            face_s: None,
             cells: Vec::new(),
             inten: Vec::new(),
             tmp: Vec::new(),
@@ -290,6 +300,27 @@ impl Renderer {
         self.fg.resize(n, [0; 3]);
         self.bg.resize(n, [0; 3]);
         self.cell_z.resize(n, 0.0);
+        if self.lum_s.len() != n {
+            self.lum_s = vec![-1.0; n];
+        }
+        // head ellipse from the face, steadied (the detector box shakes a
+        // few pixels every frame)
+        self.face_s = track.face.map(|fc| {
+            let now = [fc.cx, fc.cy, fc.w, fc.h];
+            match self.face_s {
+                Some(p) if (p[0] - now[0]).hypot(p[1] - now[1]) < p[2] * 0.5 => {
+                    let k = (dt / 0.08).clamp(0.0, 1.0);
+                    [
+                        p[0] + (now[0] - p[0]) * k,
+                        p[1] + (now[1] - p[1]) * k,
+                        p[2] + (now[2] - p[2]) * k,
+                        p[3] + (now[3] - p[3]) * k,
+                    ]
+                }
+                _ => now,
+            }
+        });
+        let face_s = self.face_s;
 
         // ---- 1. sample camera, mask and head model per cell ----
         let field = track.depth.filter(|f| f.valid);
@@ -326,16 +357,31 @@ impl Renderer {
                         }
                     }
                 }
-                let cell = &mut self.cells[gy * cols + gx];
+                let ci = gy * cols + gx;
+                let cell = &mut self.cells[ci];
                 if hits > 0.0 {
                     let k = 1.0 / 4.0; // out-of-frame samples count as black
                     cell.rgb = [acc[0] * k, acc[1] * k, acc[2] * k];
                 } else {
                     cell.rgb = [0.0; 3];
                 }
-                cell.lum =
-                    (0.299 * cell.rgb[0] + 0.587 * cell.rgb[1] + 0.114 * cell.rgb[2]) / 255.0;
+                let lum = (0.299 * cell.rgb[0] + 0.587 * cell.rgb[1] + 0.114 * cell.rgb[2]) / 255.0;
+                // filter camera grain: small changes are noise and get
+                // averaged, real changes (you moved) come through at once
+                let prev = self.lum_s[ci];
+                cell.lum = if prev < 0.0 {
+                    lum
+                } else {
+                    let k = 0.2 + 0.8 * smoothstep(0.015, 0.07, (lum - prev).abs());
+                    prev + (lum - prev) * k
+                };
+                self.lum_s[ci] = cell.lum;
                 let p = xf.map(cx, cy);
+                cell.head_w = face_s.map_or(0.0, |[fx, fy, fw, fh]| {
+                    let dx = (p[0] - fx) / (fw * 0.8);
+                    let dy = (p[1] - (fy - fh * 0.1)) / (fh * 1.0);
+                    1.0 - smoothstep(0.8, 1.3, (dx * dx + dy * dy).sqrt())
+                });
                 let in_frame =
                     src.is_some() && p[0] >= 0.0 && p[1] >= 0.0 && p[0] < sw && p[1] < sh;
                 cell.alpha = match (track.mask, in_frame) {
@@ -359,14 +405,12 @@ impl Renderer {
                             cell.alpha = sf.subject;
                             // expose for the face, not a bright shirt at
                             // the same depth
-                            let near_face = match track.face {
-                                Some(fc) => {
-                                    (p[0] - fc.cx).abs() < fc.w * 0.7
-                                        && (p[1] - fc.cy).abs() < fc.h * 0.9
-                                }
-                                None => true,
-                            };
-                            cell.in_head = sf.subject > 0.5 && sf.z < f.z_ref + 0.12 && near_face;
+                            cell.in_head = sf.subject > 0.5
+                                && if track.face.is_some() {
+                                    cell.head_w > 0.5
+                                } else {
+                                    sf.z < f.z_ref + 0.12
+                                };
                             self.cell_z[gy * cols + gx] = sf.z;
                         }
                         None => {
@@ -431,16 +475,17 @@ impl Renderer {
         let (blo, bhi) = self.body_exposure;
         let binv = 1.0 / (bhi - blo).max(0.05);
         for (i, c) in self.cells.iter().enumerate() {
-            let mut v = if c.in_head || !person_known {
-                ((c.lum - lo) * inv).clamp(0.0, 1.2)
+            let f = ((c.lum - lo) * inv).clamp(0.0, 1.2);
+            let mut v = if !person_known {
+                f
             } else {
                 // the body exposure only ever lifts (dark clothes show,
                 // bright ones stay as bright as the face exposure makes
-                // them); blended in with membership so the background and
-                // the cutout edge keep the face exposure
-                let f = ((c.lum - lo) * inv).clamp(0.0, 1.2);
+                // them); blended in smoothly by membership and by distance
+                // from the face, so there's no seam to flicker across
                 let b = ((c.lum - blo) * binv).clamp(0.0, 1.2).max(f);
-                f + (b - f) * c.alpha.clamp(0.0, 1.0)
+                let w = c.alpha.clamp(0.0, 1.0) * (1.0 - c.head_w);
+                f + (b - f) * w
             };
             v = (v - 0.5) * s.contrast + 0.5 + s.brightness;
             v = v.clamp(0.0, 1.0).powf(s.gamma);
@@ -726,17 +771,15 @@ impl Renderer {
         let gox = (s.out_width as usize - gcols * cw) as f32 / 2.0;
         let goy = (s.out_height as usize - grows * ch) as f32 / 2.0;
         let cells2d = &self.cells;
-        let is_head = |x: f32, y: f32| -> bool {
+        // the 2D cell under a source pixel (for its head weight)
+        let cell_at = |x: f32, y: f32| -> Option<&Cell> {
             let o = xf.unmap(x, y);
             let gx = ((o[0] - gox) / cw as f32).floor();
             let gy = ((o[1] - goy) / ch as f32).floor();
-            gx >= 0.0
-                && gy >= 0.0
-                && (gx as usize) < gcols
-                && (gy as usize) < grows
-                && cells2d
-                    .get(gy as usize * gcols + gx as usize)
-                    .is_some_and(|c| c.in_head)
+            if gx < 0.0 || gy < 0.0 || gx as usize >= gcols || gy as usize >= grows {
+                return None;
+            }
+            cells2d.get(gy as usize * gcols + gx as usize)
         };
         let (sw, sh) = (img.width, img.height);
         for y in (0..sh).step_by(2) {
@@ -752,8 +795,10 @@ impl Renderer {
                     continue;
                 };
                 let px = img.get(x, y);
+                let cell = cell_at(fx, fy);
                 let lum =
                     (0.299 * px[0] as f32 + 0.587 * px[1] as f32 + 0.114 * px[2] as f32) / 255.0;
+                let hw = cell.map_or(0.0, |c| c.head_w);
                 let shade = f
                     .surface(fx, fy)
                     .map(|sf| {
@@ -763,11 +808,8 @@ impl Renderer {
                     })
                     .unwrap_or(0.5);
                 let face_tv = ((lum - lo) * inv).clamp(0.0, 1.2);
-                let mut tv = if is_head(fx, fy) {
-                    face_tv
-                } else {
-                    ((lum - blo) * binv).clamp(0.0, 1.2).max(face_tv)
-                };
+                let body_tv = ((lum - blo) * binv).clamp(0.0, 1.2).max(face_tv);
+                let mut tv = face_tv + (body_tv - face_tv) * (1.0 - hw);
                 tv = (tv - 0.5) * s.contrast + 0.5 + s.brightness;
                 tv = tv.clamp(0.0, 1.0).powf(s.gamma);
                 tv *= 1.0 + ((0.25 + 0.95 * shade) - 1.0) * s.depth;

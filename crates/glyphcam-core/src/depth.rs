@@ -64,6 +64,12 @@ pub struct DepthField {
     seg_avg: Vec<f32>,
     /// Image brightness per cell last frame, for spotting motion.
     lum: Vec<f32>,
+    /// How much each cell is moving this frame (0..1).
+    mov: Vec<f32>,
+    /// How often each cell has had a depth reading lately (0..1). Dark
+    /// fabric flickers between a noisy reading and none; such spots are
+    /// filled in from steadier neighbours instead.
+    rel: Vec<f32>,
     /// Per-cell reading this frame: see `NONE`, `IN_BAND`, `AWAY`, `FILLED`.
     kind: Vec<u8>,
     raw: Vec<f32>,
@@ -81,6 +87,8 @@ pub struct DepthField {
     uw: Vec<f32>,
     /// Smoothed anchor (source pixels) and depth scale for `build_uv`.
     anchor: [f32; 2],
+    /// Smoothed anchor speed (px/s), for the speed-aware anchor filter.
+    anchor_v: f32,
     uv_zref: f32,
     /// `ru`/`rv`/`anchor` hold a previous frame.
     uv_init: bool,
@@ -173,6 +181,8 @@ impl DepthField {
                 seg: vec![0.0; n],
                 seg_avg: vec![0.0; n],
                 lum: vec![-1.0; n],
+                mov: vec![1.0; n],
+                rel: vec![1.0; n],
                 kind: vec![NONE; n],
                 raw: vec![0.0; n],
                 w: vec![0.0; n],
@@ -248,6 +258,9 @@ impl DepthField {
                 }
                 let k = slow + (1.0 - slow) * moving;
                 self.seg_avg[i] += (self.seg[i] - self.seg_avg[i]) * k;
+                self.mov[i] = moving;
+                let got = if v > 0.0 { 1.0 } else { 0.0 };
+                self.rel[i] += (got - self.rel[i]) * (dt / 0.4).clamp(0.0, 1.0);
             }
         }
 
@@ -336,6 +349,52 @@ impl DepthField {
                 IN_BAND
             };
         }
+        if mask.is_some() {
+            // readings on dark fabric are sparse, noisy and sometimes plain
+            // wrong: drop a reading where the spot rarely has one, or that
+            // disagrees with its neighbours, and let the fill below cover it
+            self.tmp_a.copy_from_slice(&self.raw);
+            for gy in 0..gh {
+                for gx in 0..gw {
+                    let i = gy * gw + gx;
+                    if self.kind[i] != IN_BAND {
+                        continue;
+                    }
+                    let mut nb = [0.0f32; 8];
+                    let mut c = 0;
+                    for dy in -1isize..=1 {
+                        for dx in -1isize..=1 {
+                            let (x, y) = (gx as isize + dx, gy as isize + dy);
+                            if (dx, dy) == (0, 0)
+                                || x < 0
+                                || y < 0
+                                || x >= gw as isize
+                                || y >= gh as isize
+                            {
+                                continue;
+                            }
+                            let z = self.tmp_a[y as usize * gw + x as usize];
+                            if z > 0.0 {
+                                nb[c] = z;
+                                c += 1;
+                            }
+                        }
+                    }
+                    let odd = if c >= 3 {
+                        let m = percentile(&mut nb[..c], 0.5);
+                        (self.tmp_a[i] - m).abs() > 0.03
+                    } else {
+                        // a lone reading with no support around it
+                        true
+                    };
+                    if odd || self.rel[i] < 0.6 {
+                        self.raw[i] = 0.0;
+                        self.w[i] = 0.0;
+                        self.kind[i] = NONE;
+                    }
+                }
+            }
+        }
         for _ in 0..3 {
             normalized_blur(
                 &mut self.raw,
@@ -413,12 +472,40 @@ impl DepthField {
                     self.kind[i] = FILLED;
                 }
             }
+            // the grown-in depth is streaky: smooth it (only it)
+            for _ in 0..3 {
+                for gy in 0..gh {
+                    for gx in 0..gw {
+                        let i = gy * gw + gx;
+                        self.tmp_a[i] = self.raw[i];
+                        if self.kind[i] != FILLED {
+                            continue;
+                        }
+                        let (mut acc, mut cnt) = (0.0, 0.0);
+                        for (dx, dy) in [(0isize, 0isize), (-1, 0), (1, 0), (0, -1), (0, 1)] {
+                            let (x, y) = (gx as isize + dx, gy as isize + dy);
+                            if x < 0 || y < 0 || x >= gw as isize || y >= gh as isize {
+                                continue;
+                            }
+                            let z = self.raw[y as usize * gw + x as usize];
+                            if z > 0.0 {
+                                acc += z;
+                                cnt += 1.0;
+                            }
+                        }
+                        self.tmp_a[i] = acc / cnt;
+                    }
+                }
+                self.raw.copy_from_slice(&self.tmp_a);
+            }
         }
 
         // 5. temporal blend; jumps (you moved) reset immediately. The
         // cutout follows within a frame or two either way, so it never
         // leaves a trail behind you.
         let a = (dt * 14.0).clamp(0.2, 1.0);
+        // where nothing moves, depth noise is averaged over ~0.2 s
+        let a_still = (dt / 0.2).clamp(0.0, 1.0);
         let k = (dt * 20.0).clamp(0.5, 1.0);
         for i in 0..n {
             let v = self.raw[i];
@@ -428,8 +515,13 @@ impl DepthField {
                 self.subject[i] = 0.0;
                 continue;
             }
-            let jump = p <= 0.0 || (v - p).abs() > 0.04;
-            self.z[i] = if jump { v } else { p + (v - p) * a };
+            let mv = self.mov[i];
+            let jump = p <= 0.0 || (v - p).abs() > 0.15 || ((v - p).abs() > 0.04 && mv > 0.3);
+            self.z[i] = if jump {
+                v
+            } else {
+                p + (v - p) * (a_still + (a - a_still) * mv)
+            };
             let target = match self.kind[i] {
                 // only a confident mask fills in (the network is unsure
                 // over screens and shiny things)
@@ -564,12 +656,22 @@ impl DepthField {
         let init = self.uv_init;
 
         // anchor and depth scale, smoothed (a big jump means a new face: snap)
+        // The face box shakes a few pixels every frame, and every glyph is
+        // laid out from this anchor, so any shake moves them all. A
+        // speed-aware filter (one-euro style): heavy smoothing while you're
+        // still, light while you move so glyphs don't lag behind you.
         let [px, py] = self.anchor;
         let jump = (cx - px).hypot(cy - py) > 60.0;
-        let (ax, ay) = if init && !jump {
-            let k = ease(0.02 + 0.2 * calm);
+        let (ax, ay) = if init && !jump && dt > 0.0 {
+            let speed = (cx - px).hypot(cy - py) / dt;
+            self.anchor_v += (speed - self.anchor_v) * ease(0.1);
+            // still: ~0.15-0.8 s; moving fast (>200 px/s): ~20 ms
+            let tau_still = 0.15 + 0.65 * calm;
+            let fast = (self.anchor_v / 200.0).clamp(0.0, 1.0);
+            let k = ease(tau_still + (0.02 - tau_still) * fast);
             (px + (cx - px) * k, py + (cy - py) * k)
         } else {
+            self.anchor_v = 0.0;
             (cx, cy)
         };
         self.anchor = [ax, ay];
@@ -646,10 +748,13 @@ impl DepthField {
 
         // smooth the curvature part over time; a large change (you turned
         // your head) follows faster so glyphs don't swim
-        let k = ease(0.03 + 0.4 * calm);
+        // where the picture is still, hold the shape much longer
+        let k_move = ease(0.03 + 0.4 * calm);
+        let k_still = ease(0.1 + 1.4 * calm);
         for gy in 0..gh {
             for gx in 0..gw {
                 let i = gy * gw + gx;
+                let k = k_still + (k_move - k_still) * self.mov[i];
                 let (fu, fv) = (flat_u(gx), flat_v(gy));
                 let nu = self.su[i] - fu;
                 let nv = self.sv[i] - fv;

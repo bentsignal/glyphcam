@@ -1,11 +1,11 @@
-//! Ties tracking, stabilization and rendering together.
+//! Ties tracking, depth and rendering together.
 
 use crate::depth::DepthField;
+use crate::framing::FrameXf;
 use crate::image::{Frame, RgbImage};
 use crate::render::{Renderer, TrackView};
 use crate::settings::Settings;
 use crate::source::SourceFrame;
-use crate::stabilize::{FaceObs, Stabilizer};
 use crate::track::{Face, Tracker};
 use anyhow::Result;
 use std::sync::Arc;
@@ -25,7 +25,6 @@ pub struct PipelineStats {
 
 pub struct Pipeline {
     tracker: Tracker,
-    stab: Stabilizer,
     renderer: Renderer,
     depth: DepthField,
     frame: Frame,
@@ -39,7 +38,6 @@ impl Pipeline {
     pub fn new() -> Result<Self> {
         Ok(Self {
             tracker: Tracker::spawn()?,
-            stab: Stabilizer::new(),
             renderer: Renderer::new(),
             depth: DepthField::new(),
             frame: Frame::default(),
@@ -49,8 +47,9 @@ impl Pipeline {
         })
     }
 
+    /// Forget temporal state (new source or a jump in the recording).
     pub fn reset_motion(&mut self) {
-        self.stab.reset();
+        self.depth.clear();
     }
 
     pub fn frame(&self) -> &Frame {
@@ -70,18 +69,21 @@ impl Pipeline {
         let img: Option<&Arc<RgbImage>> = src.map(|f| &f.image);
         let hinted = src.map(|f| f.face_hint.is_some()).unwrap_or(false);
 
-        if let Some(f) = src.filter(|_| !hinted) {
-            // A depth camera finds the person itself; skip the mask network.
-            self.tracker
-                .set_want_mask(f.depth.is_none() && (s.background.needs_mask() || s.depth > 0.0));
-            self.tracker.submit(f.image.clone());
-            if self.synchronous {
-                self.tracker.wait_idle(Duration::from_millis(500));
-                // give the worker a moment to publish
-                std::thread::sleep(Duration::from_millis(2));
+        // The mask is wanted with a depth camera too: dark clothes barely
+        // reflect its infrared, so the colour image fills in what depth misses.
+        let st = match src.filter(|_| !hinted) {
+            Some(f) => {
+                self.tracker
+                    .set_want_mask(f.depth.is_some() || s.background.needs_mask() || s.depth > 0.0);
+                let seq = self.tracker.submit(f.image.clone());
+                // Wait for this frame's result so the cutout and the image
+                // line up (no trail behind you). If inference ever runs
+                // slower than the frame rate, fall back to the latest result.
+                let budget = if self.synchronous { 500 } else { 30 };
+                self.tracker.wait_for(seq, Duration::from_millis(budget))
             }
-        }
-        let st = self.tracker.state();
+            None => self.tracker.state(),
+        };
         let src_size = img
             .map(|i| (i.width, i.height))
             .unwrap_or((s.out_width, s.out_height));
@@ -94,16 +96,16 @@ impl Pipeline {
         self.stats.detect_ms = st.detect_ms;
         self.stats.segment_ms = st.segment_ms;
 
-        let xf = self.stab.update(
-            dt,
-            face.as_ref().map(FaceObs::from),
-            src_size,
-            (s.out_width, s.out_height),
-            s,
-        );
+        let xf = FrameXf::fill(src_size, (s.out_width, s.out_height), s.mirror);
         match src.and_then(|f| f.depth.as_ref()) {
             Some(d) => {
-                self.depth.update(d, face.as_ref(), dt);
+                self.depth.update(
+                    d,
+                    face.as_ref(),
+                    mask.as_deref(),
+                    img.map(|i| i.as_ref()),
+                    dt,
+                );
                 if s.depth_mode == crate::settings::DepthMode::Wrapped {
                     let (cx, cy) = face
                         .as_ref()

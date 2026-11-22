@@ -1,14 +1,14 @@
-//! Glyph renderer: samples the camera through the stabilized transform onto a
+//! Glyph renderer: samples the camera through the framing transform onto a
 //! character grid, computes per-cell intensity (exposure, contrast, local
 //! detail, 3D head shading, background treatment), then blits glyphs from the
 //! atlas. No text layout happens per frame; the hot loop is a byte blend.
 
 use crate::color::{Palette, Rgb};
 use crate::depth::DepthField;
+use crate::framing::FrameXf;
 use crate::glyphs::{Atlas, AtlasKey, LEVELS};
 use crate::image::{Frame, RgbImage};
 use crate::settings::{Background, ColorMode, DepthMode, Settings};
-use crate::stabilize::FrameXf;
 use crate::track::{Face, Mask};
 
 /// Cell width / height ratio (monospace glyphs are roughly 0.6).
@@ -169,6 +169,9 @@ pub struct Renderer {
     atlas: Option<(AtlasKey, Atlas)>,
     drops: Vec<Drop>,
     exposure: (f32, f32),
+    /// Exposure for the rest of the body (shirt, hoodie), which can be far
+    /// darker or brighter than the face.
+    body_exposure: (f32, f32),
     cells: Vec<Cell>,
     inten: Vec<f32>,
     tmp: Vec<f32>,
@@ -222,6 +225,7 @@ impl Renderer {
             atlas: None,
             drops: Vec::new(),
             exposure: (0.0, 1.0),
+            body_exposure: (0.0, 1.0),
             cells: Vec::new(),
             inten: Vec::new(),
             tmp: Vec::new(),
@@ -393,43 +397,51 @@ impl Renderer {
             }
         }
 
-        // ---- 2. auto exposure over the face (or person, or everything) ----
+        // ---- 2. auto exposure over the face (or person, or everything),
+        // and separately over the rest of the body so dark clothes show ----
+        let person_known = field.is_some() || track.mask.is_some();
         if s.auto_exposure {
-            let mut hist = [0u32; 64];
-            let mut total = 0u32;
             let any_head = self.cells.iter().any(|c| c.in_head);
-            for c in &self.cells {
-                let use_it = if any_head { c.in_head } else { c.alpha > 0.5 };
-                if use_it {
-                    hist[((c.lum * 63.0) as usize).min(63)] += 1;
-                    total += 1;
+            let k = (dt * 2.5).clamp(0.0, 1.0);
+            if let Some((lo, hi)) = exposure_of(&self.cells, |c| {
+                if any_head {
+                    c.in_head
+                } else {
+                    c.alpha > 0.5
                 }
-            }
-            if total > 16 {
-                let pct = |p: f32| {
-                    let target = (total as f32 * p) as u32;
-                    let mut acc = 0;
-                    for (i, &h) in hist.iter().enumerate() {
-                        acc += h;
-                        if acc >= target {
-                            return i as f32 / 63.0;
-                        }
-                    }
-                    1.0
-                };
-                let lo = pct(0.03);
-                let hi = pct(0.97).max(lo + 0.15);
-                let k = (dt * 2.5).clamp(0.0, 1.0);
+            }) {
                 self.exposure.0 += (lo - self.exposure.0) * k;
                 self.exposure.1 += (hi - self.exposure.1) * k;
             }
+            let body = exposure_of(&self.cells, |c| !c.in_head && c.alpha > 0.5)
+                .filter(|_| person_known && any_head);
+            let (blo, bhi) = match body {
+                // don't stretch flat fabric into noise
+                Some((lo, hi)) => (lo.min(hi - 0.3).max(0.0), hi.max(0.08)),
+                None => self.exposure,
+            };
+            self.body_exposure.0 += (blo - self.body_exposure.0) * k;
+            self.body_exposure.1 += (bhi - self.body_exposure.1) * k;
         } else {
             self.exposure = (0.0, 1.0);
+            self.body_exposure = (0.0, 1.0);
         }
         let (lo, hi) = self.exposure;
         let inv = 1.0 / (hi - lo).max(0.05);
+        let (blo, bhi) = self.body_exposure;
+        let binv = 1.0 / (bhi - blo).max(0.05);
         for (i, c) in self.cells.iter().enumerate() {
-            let mut v = ((c.lum - lo) * inv).clamp(0.0, 1.2);
+            let mut v = if c.in_head || !person_known {
+                ((c.lum - lo) * inv).clamp(0.0, 1.2)
+            } else {
+                // the body exposure only ever lifts (dark clothes show,
+                // bright ones stay as bright as the face exposure makes
+                // them); blended in with membership so the background and
+                // the cutout edge keep the face exposure
+                let f = ((c.lum - lo) * inv).clamp(0.0, 1.2);
+                let b = ((c.lum - blo) * binv).clamp(0.0, 1.2).max(f);
+                f + (b - f) * c.alpha.clamp(0.0, 1.0)
+            };
             v = (v - 0.5) * s.contrast + 0.5 + s.brightness;
             v = v.clamp(0.0, 1.0).powf(s.gamma);
             // 3D head / depth shading
@@ -707,6 +719,25 @@ impl Renderer {
         let light = depth_light(s, t);
         let (lo, hi) = self.exposure;
         let inv = 1.0 / (hi - lo).max(0.05);
+        let (blo, bhi) = self.body_exposure;
+        let binv = 1.0 / (bhi - blo).max(0.05);
+        // which 2D cells are the head (face exposure) vs the body
+        let (gcols, grows) = (g.cols, g.rows);
+        let gox = (s.out_width as usize - gcols * cw) as f32 / 2.0;
+        let goy = (s.out_height as usize - grows * ch) as f32 / 2.0;
+        let cells2d = &self.cells;
+        let is_head = |x: f32, y: f32| -> bool {
+            let o = xf.unmap(x, y);
+            let gx = ((o[0] - gox) / cw as f32).floor();
+            let gy = ((o[1] - goy) / ch as f32).floor();
+            gx >= 0.0
+                && gy >= 0.0
+                && (gx as usize) < gcols
+                && (gy as usize) < grows
+                && cells2d
+                    .get(gy as usize * gcols + gx as usize)
+                    .is_some_and(|c| c.in_head)
+        };
         let (sw, sh) = (img.width, img.height);
         for y in (0..sh).step_by(2) {
             for x in (0..sw).step_by(2) {
@@ -731,7 +762,12 @@ impl Renderer {
                         0.3 * near + 0.7 * lit
                     })
                     .unwrap_or(0.5);
-                let mut tv = ((lum - lo) * inv).clamp(0.0, 1.2);
+                let face_tv = ((lum - lo) * inv).clamp(0.0, 1.2);
+                let mut tv = if is_head(fx, fy) {
+                    face_tv
+                } else {
+                    ((lum - blo) * binv).clamp(0.0, 1.2).max(face_tv)
+                };
                 tv = (tv - 0.5) * s.contrast + 0.5 + s.brightness;
                 tv = tv.clamp(0.0, 1.0).powf(s.gamma);
                 tv *= 1.0 + ((0.25 + 0.95 * shade) - 1.0) * s.depth;
@@ -945,6 +981,33 @@ impl Renderer {
 #[inline]
 fn dot3(a: [f32; 3], b: [f32; 3]) -> f32 {
     a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+
+/// Robust (3rd..97th percentile) luminance range of the cells `pick`
+/// selects, or `None` when there are too few.
+fn exposure_of(cells: &[Cell], pick: impl Fn(&Cell) -> bool) -> Option<(f32, f32)> {
+    let mut hist = [0u32; 64];
+    let mut total = 0u32;
+    for c in cells.iter().filter(|c| pick(c)) {
+        hist[((c.lum * 63.0) as usize).min(63)] += 1;
+        total += 1;
+    }
+    if total <= 16 {
+        return None;
+    }
+    let pct = |p: f32| {
+        let target = (total as f32 * p) as u32;
+        let mut acc = 0;
+        for (i, &h) in hist.iter().enumerate() {
+            acc += h;
+            if acc >= target {
+                return i as f32 / 63.0;
+            }
+        }
+        1.0
+    };
+    let lo = pct(0.03);
+    Some((lo, pct(0.97).max(lo + 0.15)))
 }
 
 /// Light direction for depth shading, in camera space and pointing at the

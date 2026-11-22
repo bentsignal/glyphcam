@@ -59,7 +59,7 @@ fn main() -> anyhow::Result<()> {
         p.reset_motion();
         let (mut total, mut frames, mut faces) = (0.0f32, 0u32, 0u32);
         let last = *shots.iter().max().unwrap();
-        // warm up the stabilizer for a second before the first shot
+        // warm up for a second before the first shot
         let first = shots.iter().min().unwrap().saturating_sub(30);
         for i in first..=last {
             let f = src.frame_at(i % src.len())?;
@@ -69,6 +69,27 @@ fn main() -> anyhow::Result<()> {
             frames += 1;
             faces += p.stats.face_found as u32;
             if shots.contains(&i) {
+                {
+                    // the cutout (green) over the depth (grey), source pixels
+                    let f = p.depth_field();
+                    let (w, h) = f.source_size();
+                    let mut buf = Vec::with_capacity((w * h) as usize * 3);
+                    for y in 0..h as u32 {
+                        for x in 0..w as u32 {
+                            let sf = f.surface(x as f32, y as f32);
+                            let z = sf.map_or(0.0, |s| (1.6 - s.z).clamp(0.0, 1.0) * 200.0);
+                            let sub = sf.map_or(0.0, |s| s.subject * 255.0);
+                            buf.extend([z as u8, sub as u8, z as u8]);
+                        }
+                    }
+                    image::save_buffer(
+                        format!("{out_dir}/cutout-{name}-{i}.png"),
+                        &buf,
+                        w as u32,
+                        h as u32,
+                        image::ColorType::Rgb8,
+                    )?;
+                }
                 let out = p.frame();
                 image::save_buffer(
                     format!("{out_dir}/{name}-{i}.png"),
@@ -80,9 +101,11 @@ fn main() -> anyhow::Result<()> {
             }
         }
         println!(
-            "{name:16} frames={frames} faces={faces} avg_ms={:.2} render_ms={:.2} depth_ok={} face_at={:.2}m",
+            "{name:16} frames={frames} faces={faces} avg_ms={:.2} render_ms={:.2} detect_ms={:.1} segment_ms={:.1} depth_ok={} face_at={:.2}m",
             total / frames as f32,
             p.stats.render_ms,
+            p.stats.detect_ms,
+            p.stats.segment_ms,
             p.stats.depth_ok,
             p.stats.depth_m
         );

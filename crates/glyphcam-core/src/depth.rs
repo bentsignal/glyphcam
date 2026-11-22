@@ -3,8 +3,16 @@
 //! frame ([`DepthField`]). The field fills holes (glasses, IR dropouts),
 //! smooths the sensor noise, keeps a little temporal memory, and decides which
 //! pixels belong to the person in front of the camera.
+//!
+//! Who is the person comes from depth *and* the colour segmentation mask.
+//! Dark fabric, hair and headphones reflect the sensor's infrared poorly and
+//! often have no depth at all, so where depth is missing the mask decides
+//! (and the depth is filled in from the body around it). Where depth does
+//! read something far behind you, the mask is overruled, which keeps the
+//! mask's halos and false hits on the background out of the cutout.
 
-use crate::track::Face;
+use crate::image::RgbImage;
+use crate::track::{Face, Mask};
 
 /// Pinhole intrinsics of the colour stream the depth is aligned to.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -48,8 +56,16 @@ pub struct DepthField {
     subject: Vec<f32>,
     /// `subject` softened over neighbours: what callers read.
     sub_s: Vec<f32>,
-    /// Seconds since each cell last had a depth reading.
-    hold: Vec<f32>,
+    /// Segmentation mask at each cell this frame (0 without a mask).
+    seg: Vec<f32>,
+    /// `seg` averaged over time where nothing moves (a monitor the network
+    /// can't make its mind up about); wherever the image or the depth
+    /// changes it follows at once, so a moving person is never late.
+    seg_avg: Vec<f32>,
+    /// Image brightness per cell last frame, for spotting motion.
+    lum: Vec<f32>,
+    /// Per-cell reading this frame: see `NONE`, `IN_BAND`, `AWAY`, `FILLED`.
+    kind: Vec<u8>,
     raw: Vec<f32>,
     w: Vec<f32>,
     /// Surface coordinates in metres (arc length along the skin from the
@@ -70,6 +86,9 @@ pub struct DepthField {
     uv_init: bool,
     tmp_a: Vec<f32>,
     tmp_b: Vec<f32>,
+    /// Connected-piece labels for dropping stray bits of the cutout.
+    label: Vec<u32>,
+    stack: Vec<usize>,
     /// Depth of the face (or nearest surface), metres.
     pub z_ref: f32,
     pub valid: bool,
@@ -84,10 +103,16 @@ pub struct DepthField {
 /// so the whole frame gets the background treatment instead of the nearest
 /// chair or desk standing in for you.
 const AWAY_AFTER: f32 = 3.0;
-/// How long a spot keeps its depth after the reading drops out (seconds).
-const HOLD: f32 = 0.4;
-/// How long the cutout takes to let go of a spot (seconds).
-const FADE: f32 = 0.35;
+
+/// No depth reading.
+const NONE: u8 = 0;
+/// Depth within the person's band.
+const IN_BAND: u8 = 1;
+/// Depth well behind (or in front of) the person: not you, whatever the
+/// mask says.
+const AWAY: u8 = 2;
+/// No reading, but the mask says it's you; depth filled in from around it.
+const FILLED: u8 = 3;
 
 /// Sampled surface at a source pixel.
 #[derive(Clone, Copy, Debug)]
@@ -122,8 +147,17 @@ impl DepthField {
     }
 
     /// Rebuild the field from a new depth frame. `face` (in source pixels)
-    /// anchors which depth counts as "you".
-    pub fn update(&mut self, d: &DepthMap, face: Option<&Face>, dt: f32) {
+    /// anchors which depth counts as "you"; `mask` (the colour segmentation
+    /// for the same frame) fills in where depth has no reading; `img` (the
+    /// colour frame) tells still parts of the scene from moving ones.
+    pub fn update(
+        &mut self,
+        d: &DepthMap,
+        face: Option<&Face>,
+        mask: Option<&Mask>,
+        img: Option<&RgbImage>,
+        dt: f32,
+    ) {
         let gw = (d.width as usize).div_ceil(CELL);
         let gh = (d.height as usize).div_ceil(CELL);
         let n = gw * gh;
@@ -136,7 +170,10 @@ impl DepthField {
                 z: vec![0.0; n],
                 subject: vec![0.0; n],
                 sub_s: vec![0.0; n],
-                hold: vec![0.0; n],
+                seg: vec![0.0; n],
+                seg_avg: vec![0.0; n],
+                lum: vec![-1.0; n],
+                kind: vec![NONE; n],
                 raw: vec![0.0; n],
                 w: vec![0.0; n],
                 su: vec![f32::NAN; n],
@@ -178,8 +215,44 @@ impl DepthField {
             }
         }
 
-        // 2. reference depth: the face if we know where it is, else the
-        // nearest sizeable surface
+        // the mask at each cell, steadied where nothing moves
+        let (sw, sh) = (d.width as f32, d.height as f32);
+        let img = img.filter(|i| i.width == d.width && i.height == d.height);
+        let slow = (dt / 0.3).clamp(0.0, 1.0);
+        for gy in 0..gh {
+            for gx in 0..gw {
+                let i = gy * gw + gx;
+                let cx = (gx * CELL) as f32 + CELL as f32 * 0.5;
+                let cy = (gy * CELL) as f32 + CELL as f32 * 0.5;
+                self.seg[i] = mask.map_or(0.0, |m| m.sample(cx / sw, cy / sh));
+                // motion: the picture changed here, or the depth jumped
+                let mut moving = 1.0f32;
+                if let Some(im) = img {
+                    let (x0, y0) = ((gx * CELL) as u32, (gy * CELL) as u32);
+                    let mut l = 0.0;
+                    for (dx, dy) in [(0, 0), (2, 0), (0, 2), (2, 2)] {
+                        let px = im.get((x0 + dx).min(im.width - 1), (y0 + dy).min(im.height - 1));
+                        l += px[0] as f32 + 2.0 * px[1] as f32 + px[2] as f32;
+                    }
+                    l /= 4.0 * 4.0 * 255.0;
+                    let prev = self.lum[i];
+                    self.lum[i] = l;
+                    if prev >= 0.0 {
+                        moving = (((l - prev).abs() - 0.02) / 0.05).clamp(0.0, 1.0);
+                    }
+                }
+                let (v, p) = (self.raw[i], self.z[i]);
+                // (losing a reading isn't motion: dark fabric does that)
+                if v > 0.0 && (p <= 0.0 || (v - p).abs() > 0.04) {
+                    moving = 1.0;
+                }
+                let k = slow + (1.0 - slow) * moving;
+                self.seg_avg[i] += (self.seg[i] - self.seg_avg[i]) * k;
+            }
+        }
+
+        // 2. reference depth: the face if we know where it is, else what
+        // the mask calls you, else the nearest sizeable surface
         let mut zs: Vec<f32> = Vec::new();
         if let Some(f) = face {
             let (x0, x1) = (f.cx - f.w * 0.4, f.cx + f.w * 0.4);
@@ -209,8 +282,21 @@ impl DepthField {
         } else {
             (self.present - dt / 0.6).max(0.0)
         };
+        let mut by_mask = None;
+        if zs.len() < 8 && mask.is_some() && self.present >= 1.0 {
+            let mut ms: Vec<f32> = (0..n)
+                .filter(|&i| self.raw[i] > 0.0 && self.seg[i] > 0.6)
+                .map(|i| self.raw[i])
+                .collect();
+            if ms.len() >= 30 {
+                // the mask can spill onto the wall behind you: lean near
+                by_mask = Some(percentile(&mut ms, 0.3));
+            }
+        }
         let z_now = if zs.len() >= 8 {
             percentile(&mut zs, 0.5)
+        } else if let Some(z) = by_mask {
+            z
         } else {
             zs = self.raw.iter().copied().filter(|&v| v > 0.0).collect();
             if zs.len() < 30 {
@@ -220,6 +306,7 @@ impl DepthField {
                     self.z.iter_mut().for_each(|v| *v = 0.0);
                     self.subject.iter_mut().for_each(|v| *v = 0.0);
                     self.sub_s.iter_mut().for_each(|v| *v = 0.0);
+                    self.kind.iter_mut().for_each(|v| *v = NONE);
                     self.valid = true;
                 } else {
                     self.valid = false;
@@ -239,10 +326,15 @@ impl DepthField {
         // 3. keep only the person, fill small holes (glasses, dropouts)
         for i in 0..n {
             let v = self.raw[i];
-            if v > 0.0 && (v < near || v > far) {
+            self.kind[i] = if v <= 0.0 {
+                NONE
+            } else if v < near || v > far {
                 self.raw[i] = 0.0;
                 self.w[i] = 0.0;
-            }
+                AWAY
+            } else {
+                IN_BAND
+            };
         }
         for _ in 0..3 {
             normalized_blur(
@@ -266,47 +358,106 @@ impl DepthField {
             false,
         );
 
-        // 5. temporal blend; jumps (you moved) reset immediately.
-        // Dark fabric, hair and headphones reflect the sensor's IR poorly, so
-        // their depth drops in and out frame to frame. A spot that loses its
-        // reading keeps its last depth for a moment and then fades out, and
-        // membership comes in fast but leaves slowly, so the cutout doesn't
-        // flicker.
+        // 4b. no reading but the mask says it's you (dark clothes, hair):
+        // grow depth in from the body around it
+        if mask.is_some() {
+            let want = |i: usize, kind: &[u8], seg: &[f32], w: &[f32]| {
+                w[i] == 0.0 && kind[i] == NONE && seg[i] > 0.5
+            };
+            for _ in 0..24 {
+                let mut grew = false;
+                for gy in 0..gh {
+                    for gx in 0..gw {
+                        let i = gy * gw + gx;
+                        self.tmp_b[i] = 0.0;
+                        if !want(i, &self.kind, &self.seg_avg, &self.w) {
+                            continue;
+                        }
+                        let (mut a, mut b) = (0.0, 0.0);
+                        for (dx, dy) in [(-1isize, 0isize), (1, 0), (0, -1), (0, 1)] {
+                            let x = gx as isize + dx;
+                            let y = gy as isize + dy;
+                            if x < 0 || y < 0 || x >= gw as isize || y >= gh as isize {
+                                continue;
+                            }
+                            let j = y as usize * gw + x as usize;
+                            if self.w[j] > 0.0 {
+                                a += self.raw[j];
+                                b += 1.0;
+                            }
+                        }
+                        if b > 0.0 {
+                            self.tmp_a[i] = a / b;
+                            self.tmp_b[i] = 1.0;
+                            grew = true;
+                        }
+                    }
+                }
+                for i in 0..n {
+                    if self.tmp_b[i] > 0.0 {
+                        self.raw[i] = self.tmp_a[i];
+                        self.w[i] = 1.0;
+                        self.kind[i] = FILLED;
+                    }
+                }
+                if !grew {
+                    break;
+                }
+            }
+            // anything the mask wants that's still empty (a whole dark
+            // torso with no depth around it): just behind the face
+            for i in 0..n {
+                if want(i, &self.kind, &self.seg_avg, &self.w) {
+                    self.raw[i] = self.z_ref + 0.08;
+                    self.w[i] = 1.0;
+                    self.kind[i] = FILLED;
+                }
+            }
+        }
+
+        // 5. temporal blend; jumps (you moved) reset immediately. The
+        // cutout follows within a frame or two either way, so it never
+        // leaves a trail behind you.
         let a = (dt * 14.0).clamp(0.2, 1.0);
-        let rise = a.max(0.5);
-        let fall = (dt / FADE).clamp(0.0, 1.0);
+        let k = (dt * 20.0).clamp(0.5, 1.0);
         for i in 0..n {
             let v = self.raw[i];
             let p = self.z[i];
             if v <= 0.0 {
-                self.hold[i] += dt;
-                if p > 0.0 && self.hold[i] > HOLD {
-                    self.subject[i] = (self.subject[i] - fall).max(0.0);
-                    if self.subject[i] <= 0.0 {
-                        self.z[i] = 0.0;
-                    }
-                } else if p <= 0.0 {
-                    self.subject[i] = 0.0;
-                }
+                self.z[i] = 0.0;
+                self.subject[i] = 0.0;
                 continue;
             }
-            self.hold[i] = 0.0;
-            self.z[i] = if p <= 0.0 || (v - p).abs() > 0.04 {
-                v
-            } else {
-                p + (v - p) * a
-            };
-            // fade the far edge of the band so the cutout isn't a hard wall
-            let edge = ((far - v) / 0.08).clamp(0.0, 1.0) * self.present;
+            let jump = p <= 0.0 || (v - p).abs() > 0.04;
+            self.z[i] = if jump { v } else { p + (v - p) * a };
+            let target = match self.kind[i] {
+                // only a confident mask fills in (the network is unsure
+                // over screens and shiny things)
+                FILLED => ((self.seg_avg[i] - 0.45) / 0.35).clamp(0.0, 1.0),
+                // a depth reading: you, fading out toward the back of the
+                // band so the cutout isn't a hard wall; with a mask, things
+                // at your depth that clearly aren't a person (a monitor, a
+                // chair arm) are left out
+                _ => {
+                    let edge = ((far - v) / 0.08).clamp(0.0, 1.0);
+                    if mask.is_some() {
+                        edge * ((self.seg_avg[i] - 0.3) / 0.3).clamp(0.0, 1.0)
+                    } else {
+                        edge
+                    }
+                }
+            } * self.present;
             let cur = self.subject[i];
-            self.subject[i] = if p <= 0.0 && cur <= 0.0 {
-                edge
-            } else if edge > cur {
-                cur + (edge - cur) * rise
+            self.subject[i] = if p <= 0.0 {
+                target
             } else {
-                cur + (edge - cur) * fall.max(0.08)
+                cur + (target - cur) * k
             };
         }
+        // 5b. drop stray pieces (a lamp or a laptop corner at your depth):
+        // anything much smaller than the biggest piece, which is you
+        drop_small_pieces(&mut self.subject, &mut self.label, &mut self.stack, gw, gh);
+
         // 6. soften the cutout edge over neighbours (read-only copy, so the
         // blur doesn't build up over time)
         for gy in 0..gh {
@@ -581,6 +732,63 @@ impl DepthField {
     }
 }
 
+/// Zero the connected pieces of `sub` (cells above 0.25) that are smaller
+/// than 4% of the largest one (a hand is bigger than that), or tiny. A
+/// second person stays.
+fn drop_small_pieces(
+    sub: &mut [f32],
+    label: &mut Vec<u32>,
+    stack: &mut Vec<usize>,
+    gw: usize,
+    gh: usize,
+) {
+    let n = gw * gh;
+    label.clear();
+    label.resize(n, 0);
+    let mut sizes: Vec<usize> = vec![0];
+    for start in 0..n {
+        if label[start] != 0 || sub[start] <= 0.25 {
+            continue;
+        }
+        let id = sizes.len() as u32;
+        let mut size = 0;
+        stack.clear();
+        stack.push(start);
+        label[start] = id;
+        while let Some(i) = stack.pop() {
+            size += 1;
+            let (x, y) = (i % gw, i / gw);
+            let mut visit = |j: usize| {
+                if label[j] == 0 && sub[j] > 0.25 {
+                    label[j] = id;
+                    stack.push(j);
+                }
+            };
+            if x > 0 {
+                visit(i - 1);
+            }
+            if x + 1 < gw {
+                visit(i + 1);
+            }
+            if y > 0 {
+                visit(i - gw);
+            }
+            if y + 1 < gh {
+                visit(i + gw);
+            }
+        }
+        sizes.push(size);
+    }
+    let biggest = sizes.iter().copied().max().unwrap_or(0);
+    let keep = (biggest as f32 * 0.04).max(40.0) as usize;
+    for i in 0..n {
+        let l = label[i] as usize;
+        if l != 0 && sizes[l] < keep {
+            sub[i] = 0.0;
+        }
+    }
+}
+
 fn percentile(v: &mut [f32], p: f32) -> f32 {
     let k = ((v.len() - 1) as f32 * p) as usize;
     *v.select_nth_unstable_by(k, |a, b| a.total_cmp(b)).1
@@ -638,7 +846,9 @@ fn normalized_blur(
 mod tests {
     use super::*;
 
-    fn sphere(w: u32, h: u32) -> DepthMap {
+    /// A ball 0.5 m away centred at (cx, cy) source pixels, on an optional
+    /// wall at `wall` metres.
+    fn scene(w: u32, h: u32, cx: f32, cy: f32, wall: f32) -> DepthMap {
         let intr = Intrinsics {
             fx: 600.0,
             fy: 600.0,
@@ -646,8 +856,8 @@ mod tests {
             ppy: h as f32 / 2.0,
         };
         let scale = 0.000125;
-        let mut data = vec![0u16; (w * h) as usize];
-        let (cx, cy, r) = (w as f32 / 2.0, h as f32 / 2.0, h as f32 * 0.3);
+        let mut data = vec![(wall / scale) as u16; (w * h) as usize];
+        let r = h as f32 * 0.3;
         for y in 0..h {
             for x in 0..w {
                 let dx = (x as f32 - cx) / r;
@@ -669,11 +879,33 @@ mod tests {
         }
     }
 
+    fn sphere(w: u32, h: u32) -> DepthMap {
+        scene(w, h, w as f32 / 2.0, h as f32 / 2.0, 0.0)
+    }
+
+    /// What the segmentation would say: the ball (plus `extra` pixels
+    /// around it, like a halo).
+    fn ball_mask(w: u32, h: u32, cx: f32, cy: f32, extra: f32) -> Mask {
+        let (mw, mh) = (128usize, 96usize);
+        let r = h as f32 * 0.3 + extra;
+        let mut data = vec![0.0; mw * mh];
+        for my in 0..mh {
+            for mx in 0..mw {
+                let x = (mx as f32 + 0.5) / mw as f32 * w as f32;
+                let y = (my as f32 + 0.5) / mh as f32 * h as f32;
+                if (x - cx).hypot(y - cy) < r {
+                    data[my * mw + mx] = 1.0;
+                }
+            }
+        }
+        Mask { w: mw, h: mh, data }
+    }
+
     #[test]
     fn field_finds_surface_and_normals() {
         let d = sphere(320, 240);
         let mut f = DepthField::new();
-        f.update(&d, None, 1.0 / 30.0);
+        f.update(&d, None, None, None, 1.0 / 30.0);
         assert!(f.valid);
         let c = f.surface(160.0, 120.0).unwrap();
         assert!((c.z - 0.50).abs() < 0.01, "centre depth {}", c.z);
@@ -689,30 +921,80 @@ mod tests {
     }
 
     #[test]
-    fn cutout_holds_through_ir_dropouts() {
-        // dark headphones / hoodie: most of the readings vanish at random
-        // every frame; the person must not flicker in and out
+    fn dark_clothes_without_depth_still_count() {
+        // a dark hoodie: the right half of the person has no depth at all,
+        // some of it flickering; the mask still sees it
+        let mask = ball_mask(320, 240, 160.0, 120.0, 0.0);
         let mut f = DepthField::new();
         let mut seed = 1u32;
         let mut worst = 1.0f32;
-        for frame in 0..90 {
+        for frame in 0..30 {
             let mut d = sphere(320, 240);
             for (i, v) in d.data.iter_mut().enumerate() {
                 let x = (i % 320) as i32 - 160;
-                let y = (i / 320) as i32 - 120;
                 seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
-                // whole 16x16 blocks drop out together, like a dark patch
-                let blk = ((x + 160) / 16 * 31 + (y + 120) / 16 * 17 + frame * 7) % 3;
-                if x * x + y * y < 90 * 90 && x > 20 && (blk == 0 || seed >> 31 == 1) {
+                if x > 10 || (x > -20 && seed >> 31 == 1) {
                     *v = 0;
                 }
             }
-            f.update(&d, None, 1.0 / 30.0);
-            if frame >= 15 {
-                worst = worst.min(f.surface(220.0, 120.0).map(|s| s.subject).unwrap_or(0.0));
+            f.update(&d, None, Some(&mask), None, 1.0 / 30.0);
+            if frame >= 2 {
+                for x in [190.0, 220.0, 225.0] {
+                    let s = f.surface(x, 120.0).expect("filled depth");
+                    assert!((s.z - 0.52).abs() < 0.1, "filled depth {}", s.z);
+                    worst = worst.min(s.subject);
+                }
             }
         }
-        assert!(worst > 0.5, "cutout dropped to {worst}");
+        assert!(worst > 0.8, "cutout dropped to {worst}");
+    }
+
+    #[test]
+    fn mask_halo_over_the_background_is_trimmed() {
+        // the mask spills 30 px past the person onto a wall 1.5 m back;
+        // depth knows that's wall
+        let d = scene(320, 240, 160.0, 120.0, 1.5);
+        let mask = ball_mask(320, 240, 160.0, 120.0, 30.0);
+        let mut f = DepthField::new();
+        for _ in 0..5 {
+            f.update(&d, None, Some(&mask), None, 1.0 / 30.0);
+        }
+        assert!(f.surface(160.0, 120.0).unwrap().subject > 0.9);
+        let halo = f
+            .surface(160.0 + 72.0 + 20.0, 120.0)
+            .map_or(0.0, |s| s.subject);
+        assert!(halo < 0.05, "halo kept at {halo}");
+    }
+
+    #[test]
+    fn cutout_follows_movement_without_a_trail() {
+        let mut f = DepthField::new();
+        let mut cx = 100.0;
+        for _ in 0..10 {
+            let d = scene(320, 240, cx, 120.0, 1.5);
+            f.update(
+                &d,
+                None,
+                Some(&ball_mask(320, 240, cx, 120.0, 0.0)),
+                None,
+                1.0 / 30.0,
+            );
+        }
+        // jump 120 px to the right: two frames later the old spot is clear
+        cx = 220.0;
+        for _ in 0..2 {
+            let d = scene(320, 240, cx, 120.0, 1.5);
+            f.update(
+                &d,
+                None,
+                Some(&ball_mask(320, 240, cx, 120.0, 0.0)),
+                None,
+                1.0 / 30.0,
+            );
+        }
+        let old = f.surface(60.0, 120.0).map_or(0.0, |s| s.subject);
+        assert!(old < 0.05, "trail at {old}");
+        assert!(f.surface(220.0, 120.0).unwrap().subject > 0.9);
     }
 
     #[test]
@@ -721,12 +1003,12 @@ mod tests {
         let mut f = DepthField::new();
         // a short spell without a face changes nothing
         for _ in 0..60 {
-            f.update(&d, None, 1.0 / 30.0);
+            f.update(&d, None, None, None, 1.0 / 30.0);
         }
         assert!(f.surface(160.0, 120.0).unwrap().subject > 0.9);
         // a long one fades the person out completely
         for _ in 0..90 {
-            f.update(&d, None, 1.0 / 30.0);
+            f.update(&d, None, None, None, 1.0 / 30.0);
         }
         assert!(f.surface(160.0, 120.0).unwrap().subject < 0.01);
         assert!(f.valid);

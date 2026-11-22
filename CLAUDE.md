@@ -6,7 +6,7 @@ Real-time glyph-art face camera with a virtual webcam. Rust workspace, Windows +
 
 | Crate | Role |
 | --- | --- |
-| `crates/glyphcam-core` | Pipeline (no platform code): `track.rs` (BlazeFace detection + selfie segmentation via `tract`, on a worker thread), `stabilize.rs` (spring-damper "view model" rig with a hard clamp so the face never leaves the frame), `render.rs` (cell sampling, exposure, depth shading from a fitted head ellipsoid, digital rain, glyph-atlas blit into BGRA), `glyphs.rs` (font rasterization into a density-sorted atlas), `color.rs`, `settings.rs`, `source.rs` (Demo + Image test sources). |
+| `crates/glyphcam-core` | Pipeline (no platform code): `track.rs` (BlazeFace detection + selfie segmentation via `tract`, both on every frame, side by side on a worker; the pipeline waits up to 30 ms for the current frame's result so the cutout never lags the image), `framing.rs` (fixed fill + mirror transform; the old face-stabilizer "view model" was removed at the user's request), `render.rs` (cell sampling, face exposure plus a lift-only body exposure so dark clothes show, depth shading from a fitted head ellipsoid, digital rain, glyph-atlas blit into BGRA), `glyphs.rs` (font rasterization into a density-sorted atlas), `color.rs`, `settings.rs`, `source.rs` (Demo + Image test sources). |
 | `crates/glyphcam-shm` | Shared-memory frame protocol (`Local\glyphcam-vcam-v1`, 3 seqlocked BGRA slots, heartbeats both ways) + Windows per-user COM registration of the filter (`win.rs`). The layout must stay identical for 32/64-bit. Bump `VERSION` + mapping name on any change. |
 | `crates/glyphcam-vcam-dshow` | `glyphcam_vcam.dll`: DirectShow source filter loaded *inside* Discord/Zoom/OBS/browsers. Reads the shared memory and converts to YUY2/NV12/I420/RGB24/RGB32 at 4 sizes. It shows a placeholder card when the app isn't feeding frames. The vtable is patched so `GetState` returns `VFW_S_CANT_CUE` (live source). |
 | `crates/glyphcam-vcam-mf` | `glyphcam_mfcam.dll`: Windows 11 Media Foundation virtual camera source (`IMFActivate` → `IMFMediaSourceEx` + `IMFMediaStream2`, ported from smourier/VCamSample). The Frame Server service loads it (session 0, LOCAL SERVICE), so it must be registered in **HKLM** and live in `%ProgramFiles%\glyphcam\camera\p<proto>-<build>\`. The app does that via an elevated `--install-system-camera` and creates the camera itself with `MFCreateVirtualCamera` (system lifetime, current user; no admin). Frames come through `Global\glyphcam-mf-v1`, which the source creates and the app polls for (`OpenFileMapping`). **Discord only sees this camera** (it enumerates via Media Foundation). |
@@ -21,7 +21,7 @@ Models and fonts are embedded with `include_bytes!` from `assets/` (see THIRD-PA
 - Preview frames become `RenderImage`s (BGRA); retired images are dropped with `window.drop_image` on the next render.
 - Theme edits must go through `Theme::update` (components read derived tokens). GPUI embeds its own Windows manifest, so `packaging/windows/glyphcam.rc` only carries the icon.
 - Only the icons we use are embedded (`UiAssets`: gpui-component's default set plus `assets/ui-icons/`).
-- Drive the window from scripts for checks: `--tab look|framing|camera|output|app` opens a given tab.
+- Drive the window from scripts for checks: `--tab look|camera|output|app` opens a given tab.
 
 ## Build / run / test
 
@@ -32,7 +32,7 @@ cargo run -p glyphcam-core --release --example render_test -- <image.jpg|demo> <
 target/release/glyphcam --selftest out.png      # headless pipeline check (used in CI)
 target/release/glyphcam --register-vcam         # Windows: (re)register the filter for this user
 target/release/glyphcam --install-release nightly   # run the updater non-interactively (download + install + relaunch)
-target/release/glyphcam --tab updates           # open on a given settings tab (screenshots)
+target/release/glyphcam --tab app               # open on a given settings tab (screenshots)
 ```
 
 Windows 11 camera checks (after `glyphcam --setup-system-camera`, which shows one UAC prompt):
@@ -74,7 +74,8 @@ The dev machine has no physical webcam. Its "N-LOG" camera is the user's own in-
 
 ## Depth camera (Intel RealSense, Windows)
 
-- `crates/glyphcam-core/src/depth.rs`: `DepthMap` (raw depth aligned to the colour frame) and `DepthField`, which hole-fills, smooths and temporally blends the depth on a 4-px grid, picks out the person by depth around the face (after 3 s with no face detected nobody counts as the person, so the whole frame gets the background treatment instead of the nearest chair), and builds surface (arc-length) coordinates for the Wrapped look. Depth replaces the selfie-segmentation mask and the ellipsoid head guess when present.
+- `crates/glyphcam-core/src/depth.rs`: `DepthMap` (raw depth aligned to the colour frame) and `DepthField`, which hole-fills, smooths and temporally blends the depth on a 4-px grid, picks out the person by depth around the face *fused with the colour segmentation mask* (after 3 s with no face detected nobody counts as the person, so the whole frame gets the background treatment instead of the nearest chair), and builds surface (arc-length) coordinates for the Wrapped look. Depth replaces the selfie-segmentation mask and the ellipsoid head guess when present.
+- Cutout rules (`DepthField::update`): depth in the person's band counts if the mask agrees; depth well behind you overrules the mask (kills its halos); no depth (dark fabric, hair, headphones absorb the SR305's IR; screens too) falls back to a confident mask, with depth grown in from the body around it. The mask is time-averaged only where neither the image nor the depth moves (a monitor the network flip-flops on), so moving people never trail; small stray pieces are dropped. Don't add hold/fade memory to the cutout: that was the ~0.75 s trail users saw. `depth_test` also dumps `cutout-<look>-<frame>.png` (green = membership, grey = depth).
 - Looks (`DepthMode`): **Relief** (default; real-surface lighting), **Ridgelines** (scan lines lifted by depth, drawn as thin lines), **Wrapped** (experimental; per-pixel glyphs laid out on the skin in surface coordinates, rendered on all cores; the Calm setting `wrap_calm` smooths the surface coordinates, per-glyph tone and shimmer over time, and `--example wrap_jitter -- <recording_dir>` measures the flicker). Unknown saved names deserialize to Relief, so removed looks never reset the whole settings file.
 - `crates/glyphcam/src/realsense.rs` loads `realsense2.dll` at runtime (`libloading`), streams 640x480 colour + Z16 depth at 30 fps, and aligns depth to colour in the SDK. The engine uses it when the selected camera's name contains "RealSense" and the DLL loads; otherwise it falls back to nokhwa.
 - **SDK version matters.** The SR305 is dropped in librealsense ≥ 2.55, and 2.51–2.54 crash (access violation in `wait_for_frames`) on this Windows build. **2.48.0 works.** `scripts/build-realsense.cmd` builds it from source (static CRT, `/FI` force-includes for current MSVC) into `third_party/realsense/` (gitignored). CI caches that folder. `package-windows.sh` ships the DLL (required for nightly/stable builds).

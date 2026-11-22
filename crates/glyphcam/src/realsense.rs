@@ -59,6 +59,7 @@ struct Api {
     delete_pipeline_profile: unsafe extern "C" fn(P),
     pipeline_stop: unsafe extern "C" fn(P, *mut Err),
     pipeline_wait_for_frames: unsafe extern "C" fn(P, c_uint, *mut Err) -> P,
+    pipeline_poll_for_frames: unsafe extern "C" fn(P, *mut P, *mut Err) -> c_int,
     create_align: unsafe extern "C" fn(c_int, *mut Err) -> P,
     delete_processing_block: unsafe extern "C" fn(P),
     create_frame_queue: unsafe extern "C" fn(c_int, *mut Err) -> P,
@@ -160,6 +161,7 @@ impl Api {
             delete_pipeline_profile: sym!("rs2_delete_pipeline_profile"),
             pipeline_stop: sym!("rs2_pipeline_stop"),
             pipeline_wait_for_frames: sym!("rs2_pipeline_wait_for_frames"),
+            pipeline_poll_for_frames: sym!("rs2_pipeline_poll_for_frames"),
             create_align: sym!("rs2_create_align"),
             delete_processing_block: sym!("rs2_delete_processing_block"),
             create_frame_queue: sym!("rs2_create_frame_queue"),
@@ -426,10 +428,11 @@ fn run(shared: &(Mutex<Slot>, Condvar), stop: &AtomicBool, desc: &Mutex<String>)
 
     let mut timeouts = 0;
     let mut intr: Option<Intrinsics> = None;
+    let (mut n, mut skipped, mut work) = (0u32, 0u32, Duration::ZERO);
     while !stop.load(Ordering::Relaxed) {
         // SAFETY: as above; every frame handle obtained here is released.
         let got = unsafe {
-            let fs = (a.pipeline_wait_for_frames)(s.pipe, 1000, &mut e);
+            let mut fs = (a.pipeline_wait_for_frames)(s.pipe, 1000, &mut e);
             if !e.is_null() {
                 let r = a.check(e, "wait for frames");
                 e = std::ptr::null_mut();
@@ -440,6 +443,24 @@ fn run(shared: &(Mutex<Slot>, Condvar), stop: &AtomicBool, desc: &Mutex<String>)
                 continue;
             }
             timeouts = 0;
+            // If we fell behind, the SDK has newer framesets queued: skip
+            // to the newest so you never see yourself late.
+            loop {
+                let mut newer: P = std::ptr::null_mut();
+                let got = (a.pipeline_poll_for_frames)(s.pipe, &mut newer, &mut e);
+                if !e.is_null() {
+                    let _ = a.check(e, "poll for frames");
+                    e = std::ptr::null_mut();
+                    break;
+                }
+                if got == 0 || newer.is_null() {
+                    break;
+                }
+                (a.release_frame)(fs);
+                fs = newer;
+                skipped += 1;
+            }
+            let t0 = std::time::Instant::now();
             // process_frame takes ownership of fs
             (a.process_frame)(s.align, fs, &mut e);
             a.check(e, "align")?;
@@ -451,6 +472,15 @@ fn run(shared: &(Mutex<Slot>, Condvar), stop: &AtomicBool, desc: &Mutex<String>)
             }
             let r = read_composite(a, aligned, &mut intr);
             (a.release_frame)(aligned);
+            work += t0.elapsed();
+            n += 1;
+            if n == 300 {
+                log::info!(
+                    "RealSense: align+copy {:.1} ms/frame, skipped {skipped} stale framesets in {n}",
+                    work.as_secs_f32() * 1000.0 / n as f32
+                );
+                (n, skipped, work) = (0, 0, Duration::ZERO);
+            }
             r?
         };
         if let Some((img, depth)) = got {

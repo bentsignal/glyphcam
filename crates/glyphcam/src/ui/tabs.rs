@@ -508,79 +508,6 @@ impl GlyphUi {
     }
 
     // ------------------------------------------------------------------
-    // Framing
-    // ------------------------------------------------------------------
-
-    pub fn tab_framing(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Div {
-        let on = self.s.stabilize;
-        let mut stab = card("Face stabilisation").child(row(
-            "Keep my face centred",
-            Some("Your face stays put while you move, with a little sway"),
-            self.switch("stabilize", on, |s, v| s.stabilize = v, cx),
-        ));
-        for spec in [
-            SliderSpec::new(
-                "face_size",
-                "Face size",
-                0.2,
-                0.85,
-                |s| s.face_size,
-                |s, v| s.face_size = v,
-            )
-            .fmt(Fmt::Pct)
-            .hint("How much of the frame height your face fills"),
-            SliderSpec::new(
-                "vertical",
-                "Vertical position",
-                0.3,
-                0.65,
-                |s| s.vertical,
-                |s, v| s.vertical = v,
-            )
-            .fmt(Fmt::Pct),
-            SliderSpec::new("sway", "Sway", 0.0, 1.0, |s| s.sway, |s, v| s.sway = v)
-                .fmt(Fmt::Pct)
-                .hint("0 = locked solid, 1 = loose and bouncy"),
-            SliderSpec::new(
-                "tilt",
-                "Tilt into motion",
-                0.0,
-                1.0,
-                |s| s.tilt,
-                |s, v| s.tilt = v,
-            )
-            .fmt(Fmt::Pct),
-            SliderSpec::new(
-                "idle_bob",
-                "Idle drift",
-                0.0,
-                1.0,
-                |s| s.idle_bob,
-                |s, v| s.idle_bob = v,
-            )
-            .fmt(Fmt::Pct),
-            SliderSpec::new(
-                "roll_lock",
-                "Keep upright",
-                0.0,
-                1.0,
-                |s| s.roll_lock,
-                |s, v| s.roll_lock = v,
-            )
-            .fmt(Fmt::Pct)
-            .hint("Cancel head tilt"),
-        ] {
-            stab = stab.child(self.slider(spec, !on, window, cx));
-        }
-        let view = card("View").child(row(
-            "Mirror",
-            Some("Selfie view"),
-            self.switch("mirror", self.s.mirror, |s, v| s.mirror = v, cx),
-        ));
-        div().v_flex().gap_4().child(stab).child(view)
-    }
-
-    // ------------------------------------------------------------------
     // Camera
     // ------------------------------------------------------------------
 
@@ -643,6 +570,11 @@ impl GlyphUi {
                 }
             },
             cx,
+        ));
+        src = src.child(row(
+            "Mirror",
+            Some("Selfie view: left and right flipped, like a mirror"),
+            self.switch("mirror", self.s.mirror, |s, v| s.mirror = v, cx),
         ));
         match self.s.source.clone() {
             SourceKind::Camera(sel) => {

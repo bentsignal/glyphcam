@@ -32,18 +32,16 @@ pub type MfJob = Arc<parking_lot::Mutex<Option<Option<Result<(), String>>>>>;
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
     Look,
-    Framing,
     Camera,
     Output,
     App,
 }
 
 impl Tab {
-    pub const ALL: [Tab; 5] = [Tab::Look, Tab::Framing, Tab::Camera, Tab::Output, Tab::App];
+    pub const ALL: [Tab; 4] = [Tab::Look, Tab::Camera, Tab::Output, Tab::App];
     fn label(self) -> &'static str {
         match self {
             Tab::Look => "Look",
-            Tab::Framing => "Framing",
             Tab::Camera => "Camera",
             Tab::Output => "Output",
             Tab::App => "App",
@@ -121,7 +119,6 @@ impl GlyphUi {
             update_checked: false,
             autostart_state: None,
             tab: match l.initial_tab.as_deref() {
-                Some("framing") => Tab::Framing,
                 Some("camera") => Tab::Camera,
                 Some("output") => Tab::Output,
                 Some("app") | Some("updates") => Tab::App,
@@ -658,7 +655,6 @@ impl GlyphUi {
         let sel = Tab::ALL.iter().position(|t| *t == self.tab).unwrap_or(0);
         let body = match self.tab {
             Tab::Look => self.tab_look(window, cx),
-            Tab::Framing => self.tab_framing(window, cx),
             Tab::Camera => self.tab_camera(window, cx),
             Tab::Output => self.tab_output(window, cx),
             Tab::App => self.tab_app(window, cx),

@@ -1,6 +1,6 @@
 //! Face detection (MediaPipe BlazeFace short-range) and person segmentation
 //! (MediaPipe selfie segmentation, landscape), both run with `tract` on a
-//! background thread so the render loop never waits for inference.
+//! worker thread, side by side, on every frame.
 
 use crate::image::RgbImage;
 use anyhow::{Context, Result};
@@ -250,22 +250,28 @@ pub struct TrackState {
     pub mask: Option<Arc<Mask>>,
     /// Source dimensions the result refers to.
     pub src_size: (u32, u32),
+    /// Sequence number of the frame this result came from (see
+    /// [`Tracker::submit`]).
+    pub seq: u64,
     pub detect_ms: f32,
     pub segment_ms: f32,
 }
 
 struct Shared {
-    pending: Mutex<Option<Arc<RgbImage>>>,
+    pending: Mutex<Option<(u64, Arc<RgbImage>)>>,
     cv: Condvar,
     state: Mutex<TrackState>,
+    done: Condvar,
     want_mask: AtomicBool,
     stop: AtomicBool,
 }
 
-/// Background tracking worker. `submit` never blocks; older frames that
-/// haven't been processed yet are dropped.
+/// Background tracking worker. Every frame gets face detection and (when
+/// wanted) the person mask, run side by side. `submit` never blocks; a frame
+/// that's still waiting when a newer one arrives is dropped.
 pub struct Tracker {
     shared: Arc<Shared>,
+    seq: u64,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -278,6 +284,7 @@ impl Tracker {
             pending: Mutex::new(None),
             cv: Condvar::new(),
             state: Mutex::new(TrackState::default()),
+            done: Condvar::new(),
             want_mask: AtomicBool::new(true),
             stop: AtomicBool::new(false),
         });
@@ -287,10 +294,9 @@ impl Tracker {
             .spawn(move || {
                 let mut prev: Option<Face> = None;
                 let mut mask_smooth: Option<Mask> = None;
-                let mut n: u64 = 0;
                 let mut lost_frames: u32 = 0;
                 loop {
-                    let img = {
+                    let (seq, img) = {
                         let mut p = sh.pending.lock();
                         while p.is_none() && !sh.stop.load(Ordering::Relaxed) {
                             sh.cv.wait_for(&mut p, Duration::from_millis(500));
@@ -300,81 +306,86 @@ impl Tracker {
                         }
                         p.take().unwrap()
                     };
-                    n += 1;
-                    // Alternate detection and segmentation to halve CPU; when
-                    // the face is lost, detect every frame to reacquire fast.
                     let want_mask = sh.want_mask.load(Ordering::Relaxed);
-                    let searching = prev.is_none() || lost_frames > 0;
-                    // 30 fps input -> detection ~15 Hz, mask ~10 Hz.
-                    let phase = n % 6;
-                    let do_detect =
-                        matches!(phase, 0 | 2 | 4) || (!want_mask && !searching && phase != 3);
-                    let do_mask = want_mask && matches!(phase, 1 | 5);
-                    let mut face = None;
-                    let mut detect_ms = None;
-                    if do_detect {
-                        let t0 = Instant::now();
+                    let (faces, detect_ms, mask) = std::thread::scope(|sc| {
+                        let seg_job = want_mask.then(|| {
+                            let seg = &mut seg;
+                            let img = &img;
+                            sc.spawn(move || {
+                                let t = Instant::now();
+                                seg.segment(img)
+                                    .ok()
+                                    .map(|m| (m, t.elapsed().as_secs_f32() * 1000.0))
+                            })
+                        });
+                        let t = Instant::now();
                         let faces = det.detect(&img, 0.55).unwrap_or_default();
-                        detect_ms = Some(t0.elapsed().as_secs_f32() * 1000.0);
-                        face = pick_face(&faces, prev.as_ref());
-                        if face.is_some() {
-                            prev = face;
-                            lost_frames = 0;
-                        } else {
-                            lost_frames += 1;
-                            if lost_frames > 30 {
-                                prev = None;
-                            }
+                        let detect_ms = t.elapsed().as_secs_f32() * 1000.0;
+                        let mask = seg_job.and_then(|j| j.join().ok().flatten());
+                        (faces, detect_ms, mask)
+                    });
+                    let face = pick_face(&faces, prev.as_ref());
+                    if face.is_some() {
+                        prev = face;
+                        lost_frames = 0;
+                    } else {
+                        lost_frames += 1;
+                        if lost_frames > 30 {
+                            prev = None;
                         }
                     }
-                    let mut segment_ms = None;
-                    if do_mask {
-                        let t1 = Instant::now();
-                        if let Ok(m) = seg.segment(&img) {
-                            segment_ms = Some(t1.elapsed().as_secs_f32() * 1000.0);
-                            mask_smooth = Some(match mask_smooth.take() {
-                                Some(mut s) if s.w == m.w && s.h == m.h => {
-                                    for (a, b) in s.data.iter_mut().zip(&m.data) {
-                                        *a = *a * 0.3 + b * 0.7;
-                                    }
-                                    s
+                    let segment_ms = mask.as_ref().map(|m| m.1);
+                    if let Some((m, _)) = mask {
+                        // a touch of memory against edge shimmer; the mask
+                        // is fresh every frame, so it stays in step with you
+                        mask_smooth = Some(match mask_smooth.take() {
+                            Some(mut s) if s.w == m.w && s.h == m.h => {
+                                for (a, b) in s.data.iter_mut().zip(&m.data) {
+                                    *a = *a * 0.2 + b * 0.8;
                                 }
-                                _ => m,
-                            });
-                        }
+                                s
+                            }
+                            _ => m,
+                        });
                     }
                     let mut st = sh.state.lock();
                     st.src_size = (img.width, img.height);
-                    if let Some(ms) = detect_ms {
-                        st.detect_ms = ms;
-                        if let Some(f) = face {
-                            st.face = Some(f);
-                            st.face_time = Some(Instant::now());
-                        } else if st
-                            .face_time
-                            .is_none_or(|t| t.elapsed() > Duration::from_millis(400))
-                        {
-                            st.face = None;
-                        }
+                    st.seq = seq;
+                    st.detect_ms = detect_ms;
+                    if let Some(f) = face {
+                        st.face = Some(f);
+                        st.face_time = Some(Instant::now());
+                    } else if st
+                        .face_time
+                        .is_none_or(|t| t.elapsed() > Duration::from_millis(400))
+                    {
+                        st.face = None;
                     }
                     if let Some(ms) = segment_ms {
                         st.segment_ms = ms;
                         st.mask = mask_smooth.clone().map(Arc::new);
                     }
-                    if !sh.want_mask.load(Ordering::Relaxed) {
+                    if !want_mask {
                         st.mask = None;
+                        mask_smooth = None;
                     }
+                    drop(st);
+                    sh.done.notify_all();
                 }
             })?;
         Ok(Self {
             shared,
+            seq: 0,
             thread: Some(thread),
         })
     }
 
-    pub fn submit(&self, img: Arc<RgbImage>) {
-        *self.shared.pending.lock() = Some(img);
+    /// Queue a frame; returns its sequence number.
+    pub fn submit(&mut self, img: Arc<RgbImage>) -> u64 {
+        self.seq += 1;
+        *self.shared.pending.lock() = Some((self.seq, img));
         self.shared.cv.notify_one();
+        self.seq
     }
 
     pub fn set_want_mask(&self, on: bool) {
@@ -385,12 +396,18 @@ impl Tracker {
         self.shared.state.lock().clone()
     }
 
-    /// Wait until no frame is pending (used by deterministic tests).
-    pub fn wait_idle(&self, timeout: Duration) {
-        let start = Instant::now();
-        while self.shared.pending.lock().is_some() && start.elapsed() < timeout {
-            std::thread::sleep(Duration::from_millis(1));
+    /// Wait (at most `timeout`) until frame `seq` has been processed, so the
+    /// mask and face match the image being rendered. Returns the latest
+    /// state either way.
+    pub fn wait_for(&self, seq: u64, timeout: Duration) -> TrackState {
+        let deadline = Instant::now() + timeout;
+        let mut st = self.shared.state.lock();
+        while st.seq < seq {
+            if self.shared.done.wait_until(&mut st, deadline).timed_out() {
+                break;
+            }
         }
+        st.clone()
     }
 }
 

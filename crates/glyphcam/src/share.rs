@@ -1,5 +1,5 @@
 //! Copy/paste a glyphcam configuration between machines as a short text
-//! code (`glyphcam1:<base64 json>`). Only the look, framing and output format
+//! code (`glyphcam1:<base64 json>`). Only the look, mirror and output format
 //! travel; device-specific things (camera, ports, autostart…) stay put.
 
 use base64::Engine as _;
@@ -38,13 +38,6 @@ const SHARED_KEYS: &[&str] = &[
     "background",
     "bg_dim",
     "rain_speed",
-    "stabilize",
-    "face_size",
-    "sway",
-    "tilt",
-    "idle_bob",
-    "roll_lock",
-    "vertical",
 ];
 
 pub fn export(s: &Settings) -> String {
@@ -121,7 +114,7 @@ mod tests {
     fn roundtrip_keeps_look_but_not_device_settings() {
         let a = Settings {
             color_mode: ColorMode::Synthwave,
-            sway: 0.9,
+            gamma: 1.7,
             columns: 200,
             stream_port: 9999,
             source: SourceKind::Demo,
@@ -133,7 +126,7 @@ mod tests {
         let (c, n) = import(&code, &b).unwrap();
         assert!(n > 20);
         assert_eq!(c.color_mode, ColorMode::Synthwave);
-        assert_eq!(c.sway, 0.9);
+        assert_eq!(c.gamma, 1.7);
         assert_eq!(c.columns, 200);
         assert_eq!(c.stream_port, b.stream_port);
         assert_eq!(c.source, b.source);

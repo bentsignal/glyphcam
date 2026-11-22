@@ -292,21 +292,6 @@ pub struct Settings {
     /// Wrapped look: how much glyphs are steadied over time (0 = raw, 1 = very calm).
     pub wrap_calm: f32,
 
-    // --- framing ---
-    pub stabilize: bool,
-    /// Face height as a fraction of output height.
-    pub face_size: f32,
-    /// 0 = locked solid, 1 = loose and bouncy.
-    pub sway: f32,
-    /// View-model style tilt when you move sideways.
-    pub tilt: f32,
-    /// Gentle idle drift.
-    pub idle_bob: f32,
-    /// 0 = keep your head tilt, 1 = always upright.
-    pub roll_lock: f32,
-    /// Vertical position of the face (0 top .. 1 bottom).
-    pub vertical: f32,
-
     // --- app ---
     pub vcam_enabled: bool,
     pub preview: bool,
@@ -356,13 +341,6 @@ impl Default for Settings {
             holo: 0.4,
             glitch: 0.35,
             wrap_calm: 0.7,
-            stabilize: true,
-            face_size: 0.5,
-            sway: 0.45,
-            tilt: 0.35,
-            idle_bob: 0.25,
-            roll_lock: 0.0,
-            vertical: 0.46,
             vcam_enabled: true,
             preview: true,
             stream_server: true,
@@ -406,12 +384,6 @@ impl Settings {
         self.holo = self.holo.clamp(0.0, 1.0);
         self.glitch = self.glitch.clamp(0.0, 1.0);
         self.wrap_calm = self.wrap_calm.clamp(0.0, 1.0);
-        self.face_size = self.face_size.clamp(0.15, 0.9);
-        self.sway = self.sway.clamp(0.0, 1.0);
-        self.tilt = self.tilt.clamp(0.0, 1.0);
-        self.idle_bob = self.idle_bob.clamp(0.0, 1.0);
-        self.roll_lock = self.roll_lock.clamp(0.0, 1.0);
-        self.vertical = self.vertical.clamp(0.25, 0.75);
         if self.stream_port < 1024 {
             self.stream_port = 8737;
         }

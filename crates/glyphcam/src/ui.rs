@@ -545,15 +545,6 @@ impl GlyphApp {
                 "Lines now and then slip sideways",
             );
         }
-        if s.depth_mode == DepthMode::Wrapped {
-            Self::slider(
-                ui,
-                &mut s.wrap_calm,
-                0.0..=1.0,
-                "Calm",
-                "Steadies the glyphs on your skin: 0 = raw and twitchy, 1 = very smooth (a little lag when you move)",
-            );
-        }
 
         Self::section(ui, "Background");
         ComboBox::from_id_salt("bg")
@@ -597,7 +588,6 @@ impl GlyphApp {
             s.depth_fill = d.depth_fill;
             s.holo = d.holo;
             s.glitch = d.glitch;
-            s.wrap_calm = d.wrap_calm;
         }
     }
 

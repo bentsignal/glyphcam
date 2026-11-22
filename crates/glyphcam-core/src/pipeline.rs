@@ -104,7 +104,7 @@ impl Pipeline {
                         .as_ref()
                         .map(|f| (f.cx, f.cy))
                         .unwrap_or((d.width as f32 * 0.5, d.height as f32 * 0.4));
-                    self.depth.build_uv(cx, cy, s.wrap_calm, dt);
+                    self.depth.build_uv(cx, cy);
                 }
             }
             None => self.depth.clear(),

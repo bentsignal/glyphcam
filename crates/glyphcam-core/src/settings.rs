@@ -289,8 +289,6 @@ pub struct Settings {
     pub holo: f32,
     /// Vertex jitter and flicker (0..1).
     pub glitch: f32,
-    /// Wrapped look: how much glyphs are steadied over time (0 = raw, 1 = very calm).
-    pub wrap_calm: f32,
 
     // --- framing ---
     pub stabilize: bool,
@@ -355,7 +353,6 @@ impl Default for Settings {
             depth_fill: 0.4,
             holo: 0.4,
             glitch: 0.35,
-            wrap_calm: 0.7,
             stabilize: true,
             face_size: 0.5,
             sway: 0.45,
@@ -405,7 +402,6 @@ impl Settings {
         self.depth_fill = self.depth_fill.clamp(0.0, 1.0);
         self.holo = self.holo.clamp(0.0, 1.0);
         self.glitch = self.glitch.clamp(0.0, 1.0);
-        self.wrap_calm = self.wrap_calm.clamp(0.0, 1.0);
         self.face_size = self.face_size.clamp(0.15, 0.9);
         self.sway = self.sway.clamp(0.0, 1.0);
         self.tilt = self.tilt.clamp(0.0, 1.0);

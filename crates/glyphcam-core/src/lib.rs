@@ -8,6 +8,7 @@
 //! into a BGRA [`Frame`].
 
 pub mod color;
+pub mod depth;
 pub mod glyphs;
 pub mod image;
 pub mod pipeline;

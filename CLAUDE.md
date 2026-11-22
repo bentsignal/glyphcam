@@ -63,6 +63,14 @@ The dev machine has no physical webcam. Its "N-LOG" camera is the user's own in-
 - To cut a release: bump `[workspace.package] version` in `Cargo.toml`, commit, `git tag vX.Y.Z && git push origin main vX.Y.Z`.
 - Build identity: `GLYPHCAM_CHANNEL` (stable/nightly/dev) and `GLYPHCAM_BUILD_SHA` are baked in by `crates/glyphcam/build.rs`. The updater uses them to mark the running build. Asset names must keep the suffixes `-windows-x64-setup.exe` and `-macos-universal.app.zip`, because `updater.rs` matches on them.
 
+## Depth camera (Intel RealSense, Windows)
+
+- `crates/glyphcam-core/src/depth.rs`: `DepthMap` (raw depth aligned to the colour frame) and `DepthField`, which hole-fills, smooths and temporally blends the depth on a 4-px grid, picks out the person by depth around the face, and builds surface (arc-length) coordinates for the Wrapped look. Depth replaces the selfie-segmentation mask and the ellipsoid head guess when present.
+- Looks (`DepthMode`): **Relief** (default; real-surface lighting), **Ridgelines** (scan lines lifted by depth, drawn as thin lines), **Wrapped** (experimental; per-pixel glyphs laid out on the skin in surface coordinates, rendered on all cores). Unknown saved names deserialize to Relief, so removed looks never reset the whole settings file.
+- `crates/glyphcam/src/realsense.rs` loads `realsense2.dll` at runtime (`libloading`), streams 640x480 colour + Z16 depth at 30 fps, and aligns depth to colour in the SDK. The engine uses it when the selected camera's name contains "RealSense" and the DLL loads; otherwise it falls back to nokhwa.
+- **SDK version matters.** The SR305 is dropped in librealsense ≥ 2.55, and 2.51–2.54 crash (access violation in `wait_for_frames`) on this Windows build. **2.48.0 works.** `scripts/build-realsense.cmd` builds it from source (static CRT, `/FI` force-includes for current MSVC) into `third_party/realsense/` (gitignored). CI caches that folder. `package-windows.sh` ships the DLL (required for nightly/stable builds).
+- Test without the camera: `cargo run -p glyphcam-core --release --example depth_test -- <recording_dir> <out_dir> [frames]`. A recording is a folder with `meta.json`, `color/NNNNNN.jpg` and `depth/NNNNNN.png` (16-bit); the app can also play one (Camera tab → Depth recording). Live check: `glyphcam --depth-check out.png`.
+
 ## macOS virtual camera (not done; needs the user's paid Apple account)
 
 A real system camera on macOS 12.3+ means a CoreMediaIO Camera Extension (system extension) embedded in the app. That needs:

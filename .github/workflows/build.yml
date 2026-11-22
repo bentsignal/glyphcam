@@ -41,6 +41,14 @@ jobs:
           for p in "$(command -v makensis || true)" "/c/Program Files (x86)/NSIS/makensis.exe" "/c/Program Files/NSIS/makensis.exe"; do
             if [ -n "$p" ] && [ -x "$p" ]; then echo "MAKENSIS=$p" >> "$GITHUB_ENV"; break; fi
           done
+      - name: Cache RealSense library
+        uses: actions/cache@v4
+        with:
+          path: third_party/realsense
+          key: realsense-2.48.0-staticcrt-v1
+      - name: Build RealSense library
+        shell: cmd
+        run: scripts\build-realsense.cmd
       - name: Test
         run: cargo test --release --locked --workspace
       - name: Package

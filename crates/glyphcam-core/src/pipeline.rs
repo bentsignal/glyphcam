@@ -1,5 +1,6 @@
 //! Ties tracking, stabilization and rendering together.
 
+use crate::depth::DepthField;
 use crate::image::{Frame, RgbImage};
 use crate::render::{Renderer, TrackView};
 use crate::settings::Settings;
@@ -13,6 +14,10 @@ use std::time::{Duration, Instant};
 #[derive(Clone, Debug, Default)]
 pub struct PipelineStats {
     pub face_found: bool,
+    /// Depth data arrived and produced a usable surface.
+    pub depth_ok: bool,
+    /// Distance to the face from the depth camera, metres (0 = unknown).
+    pub depth_m: f32,
     pub detect_ms: f32,
     pub segment_ms: f32,
     pub render_ms: f32,
@@ -22,6 +27,7 @@ pub struct Pipeline {
     tracker: Tracker,
     stab: Stabilizer,
     renderer: Renderer,
+    depth: DepthField,
     frame: Frame,
     time: f64,
     /// Wait for tracking results each frame (deterministic, for tests).
@@ -35,6 +41,7 @@ impl Pipeline {
             tracker: Tracker::spawn()?,
             stab: Stabilizer::new(),
             renderer: Renderer::new(),
+            depth: DepthField::new(),
             frame: Frame::default(),
             time: 0.0,
             synchronous: false,
@@ -59,8 +66,9 @@ impl Pipeline {
         let hinted = src.map(|f| f.face_hint.is_some()).unwrap_or(false);
 
         if let Some(f) = src.filter(|_| !hinted) {
+            // A depth camera finds the person itself; skip the mask network.
             self.tracker
-                .set_want_mask(s.background.needs_mask() || s.depth > 0.0);
+                .set_want_mask(f.depth.is_none() && (s.background.needs_mask() || s.depth > 0.0));
             self.tracker.submit(f.image.clone());
             if self.synchronous {
                 self.tracker.wait_idle(Duration::from_millis(500));
@@ -88,9 +96,29 @@ impl Pipeline {
             (s.out_width, s.out_height),
             s,
         );
+        match src.and_then(|f| f.depth.as_ref()) {
+            Some(d) => {
+                self.depth.update(d, face.as_ref(), dt);
+                if s.depth_mode == crate::settings::DepthMode::Wrapped {
+                    let (cx, cy) = face
+                        .as_ref()
+                        .map(|f| (f.cx, f.cy))
+                        .unwrap_or((d.width as f32 * 0.5, d.height as f32 * 0.4));
+                    self.depth.build_uv(cx, cy);
+                }
+            }
+            None => self.depth.clear(),
+        }
+        self.stats.depth_ok = self.depth.valid;
+        self.stats.depth_m = if self.depth.valid {
+            self.depth.z_ref
+        } else {
+            0.0
+        };
         let view = TrackView {
             face: face.as_ref(),
             mask: mask.as_deref(),
+            depth: Some(&self.depth).filter(|d| d.valid),
         };
         self.renderer.render(
             img.map(|i| i.as_ref()),

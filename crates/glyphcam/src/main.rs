@@ -7,6 +7,7 @@ mod engine;
 #[cfg(windows)]
 mod mfcam;
 mod platform;
+mod realsense;
 mod share;
 mod stream;
 mod tray;
@@ -99,6 +100,77 @@ fn selftest(out: Option<&str>) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Headless RealSense check: streams ~3 s of colour + depth through the full
+/// pipeline (ridgelines look) and optionally writes the last frame as PNG.
+fn depth_check(out: Option<&str>) -> anyhow::Result<()> {
+    use glyphcam_core::settings::DepthMode;
+    use glyphcam_core::source::SourceFrame;
+    anyhow::ensure!(
+        realsense::available(),
+        "RealSense library not found next to glyphcam (realsense2.dll)"
+    );
+    let n = realsense::device_count();
+    println!("RealSense devices: {n}");
+    anyhow::ensure!(n > 0, "no RealSense camera connected");
+    let cap = realsense::RealSenseCapture::start();
+    let mut p = glyphcam_core::Pipeline::new()?;
+    let s = glyphcam_core::Settings {
+        depth_mode: DepthMode::Ridges,
+        ..Default::default()
+    };
+    let (mut seq, mut frames, mut with_depth) = (0u64, 0u32, 0u32);
+    let t0 = std::time::Instant::now();
+    while frames < 90 && t0.elapsed() < std::time::Duration::from_secs(20) {
+        if let Some(e) = cap.error() {
+            anyhow::bail!(e);
+        }
+        let Some((sq, f)) = cap.next_frame(seq, std::time::Duration::from_millis(500)) else {
+            continue;
+        };
+        seq = sq;
+        let valid = f.depth.data.iter().filter(|&&v| v != 0).count() as f32
+            / f.depth.data.len().max(1) as f32;
+        p.process(
+            Some(&SourceFrame {
+                image: f.image,
+                face_hint: None,
+                mask_hint: None,
+                depth: Some(f.depth),
+            }),
+            &s,
+            1.0 / 30.0,
+        );
+        frames += 1;
+        with_depth += p.stats.depth_ok as u32;
+        if frames % 30 == 0 {
+            println!(
+                "frame {frames}: depth px {:.0}%  face {}  face distance {:.2} m  render {:.1} ms",
+                valid * 100.0,
+                p.stats.face_found,
+                p.stats.depth_m,
+                p.stats.render_ms
+            );
+        }
+    }
+    let fps = frames as f32 / t0.elapsed().as_secs_f32();
+    println!(
+        "{} | {frames} frames, {with_depth} with usable depth, {fps:.1} fps",
+        cap.format_desc.lock()
+    );
+    if let Some(path) = out {
+        let frame = p.frame();
+        image::save_buffer(
+            path,
+            &frame.to_rgb(),
+            frame.width,
+            frame.height,
+            image::ColorType::Rgb8,
+        )?;
+    }
+    anyhow::ensure!(frames > 0, "no frames from the depth camera");
+    Ok(())
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let has = |f: &str| args.iter().any(|a| a == f);
@@ -110,6 +182,7 @@ fn main() {
     };
 
     if has("--selftest")
+        || has("--depth-check")
         || has("--register-vcam")
         || has("--unregister-vcam")
         || has("--version")
@@ -128,6 +201,15 @@ fn main() {
             Ok(()) => std::process::exit(0),
             Err(e) => {
                 eprintln!("selftest failed: {e:#}");
+                std::process::exit(1);
+            }
+        }
+    }
+    if has("--depth-check") {
+        match depth_check(arg_after("--depth-check").filter(|a| !a.starts_with("--"))) {
+            Ok(()) => std::process::exit(0),
+            Err(e) => {
+                eprintln!("depth check failed: {e:#}");
                 std::process::exit(1);
             }
         }

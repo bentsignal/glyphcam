@@ -12,7 +12,7 @@ use eframe::egui::{
 };
 use glyphcam_core::glyphs;
 use glyphcam_core::settings::{
-    Background, ColorMode, GlyphPreset, Scripts, Settings, SourceKind, OUTPUT_SIZES,
+    Background, ColorMode, DepthMode, GlyphPreset, Scripts, Settings, SourceKind, OUTPUT_SIZES,
 };
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::{Receiver, Sender};
@@ -51,6 +51,7 @@ pub struct GlyphApp {
     update_checked: bool,
     autostart_state: Option<bool>,
     image_path: String,
+    rec_path: String,
     toast: Option<(String, Instant)>,
     close_prompt: bool,
     engine: Option<std::thread::JoinHandle<()>>,
@@ -127,6 +128,10 @@ impl GlyphApp {
             SourceKind::Image(p) => p.clone(),
             _ => String::new(),
         };
+        let rec_path = match &s.source {
+            SourceKind::DepthRecording(p) => p.clone(),
+            _ => String::new(),
+        };
         let mut app = GlyphApp {
             seen_rev: l.sh.settings_rev.load(Ordering::SeqCst),
             sh: l.sh,
@@ -150,6 +155,7 @@ impl GlyphApp {
             update_checked: false,
             autostart_state: None,
             image_path,
+            rec_path,
             toast: None,
             close_prompt: false,
             engine: Some(l.engine),
@@ -484,6 +490,62 @@ impl GlyphApp {
             "How often characters re-roll",
         );
 
+        Self::section(ui, "Depth camera");
+        let st = self.sh.status.lock().clone();
+        ui.label(
+            RichText::new(if st.depth {
+                format!(
+                    "Depth active: your face is {:.0} cm from the camera.",
+                    st.depth_m * 100.0
+                )
+            } else {
+                "Needs a depth camera (Intel RealSense) or a depth recording; \
+                 Camera tab. Without one, the head shape is estimated."
+                    .to_string()
+            })
+            .color(if st.depth { ACCENT } else { MUTED })
+            .size(12.0),
+        );
+        let s = &mut self.s;
+        ComboBox::from_id_salt("depthmode")
+            .selected_text(s.depth_mode.label())
+            .width(220.0)
+            .show_ui(ui, |ui| {
+                for m in DepthMode::ALL {
+                    ui.selectable_value(&mut s.depth_mode, m, m.label());
+                }
+            });
+        if s.depth_mode == DepthMode::Ridges {
+            Self::slider(
+                ui,
+                &mut s.mesh_detail,
+                0.0..=1.0,
+                "Line density",
+                "0 = few lines, 1 = many",
+            );
+            Self::slider(
+                ui,
+                &mut s.depth_fill,
+                0.0..=1.0,
+                "Face glyphs",
+                "How much of the normal glyph face shows under the lines",
+            );
+            Self::slider(
+                ui,
+                &mut s.holo,
+                0.0..=1.0,
+                "Relief height",
+                "How far your face lifts the lines; also makes them ripple and the light move",
+            );
+            Self::slider(
+                ui,
+                &mut s.glitch,
+                0.0..=1.0,
+                "Glitch",
+                "Lines now and then slip sideways",
+            );
+        }
+
         Self::section(ui, "Background");
         ComboBox::from_id_salt("bg")
             .selected_text(s.background.label())
@@ -521,6 +583,11 @@ impl GlyphApp {
             s.background = d.background;
             s.bg_dim = d.bg_dim;
             s.rain_speed = d.rain_speed;
+            s.depth_mode = d.depth_mode;
+            s.mesh_detail = d.mesh_detail;
+            s.depth_fill = d.depth_fill;
+            s.holo = d.holo;
+            s.glitch = d.glitch;
         }
     }
 
@@ -584,6 +651,7 @@ impl GlyphApp {
             SourceKind::Camera(_) => 0,
             SourceKind::Demo => 1,
             SourceKind::Image(_) => 2,
+            SourceKind::DepthRecording(_) => 3,
         };
         ui.horizontal(|ui| {
             if ui.selectable_label(kind == 0, "Camera").clicked() && kind != 0 {
@@ -594,6 +662,9 @@ impl GlyphApp {
             }
             if ui.selectable_label(kind == 2, "Image file").clicked() && kind != 2 {
                 s.source = SourceKind::Image(self.image_path.clone());
+            }
+            if ui.selectable_label(kind == 3, "Depth recording").clicked() && kind != 3 {
+                s.source = SourceKind::DepthRecording(self.rec_path.clone());
             }
         });
         match &mut s.source {
@@ -655,6 +726,22 @@ impl GlyphApp {
                     .size(12.0),
                 );
             }
+            SourceKind::DepthRecording(p) => {
+                ui.horizontal(|ui| {
+                    ui.label("Folder");
+                    if ui.text_edit_singleline(&mut self.rec_path).lost_focus() {
+                        *p = self.rec_path.trim().trim_matches('"').to_string();
+                    }
+                });
+                ui.label(
+                    RichText::new(
+                        "A recorded colour + depth clip (folder with meta.json), looped. \
+                         Lets you try the depth looks without the camera.",
+                    )
+                    .color(MUTED)
+                    .size(12.0),
+                );
+            }
         }
 
         Self::section(ui, "Status");
@@ -668,6 +755,13 @@ impl GlyphApp {
             ui.end_row();
             ui.label("Output fps");
             ui.label(format!("{:.1}", st.fps));
+            ui.end_row();
+            ui.label("Depth");
+            ui.label(if st.depth {
+                RichText::new(format!("yes · face at {:.2} m", st.depth_m)).color(ACCENT)
+            } else {
+                RichText::new("no depth data").color(MUTED)
+            });
             ui.end_row();
             ui.label("Face");
             ui.label(if st.face {

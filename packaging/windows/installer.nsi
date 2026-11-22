@@ -90,6 +90,10 @@ Section "glyphcam" SecMain
     ${EndIf}
   File "${SRCDIR}\LICENSE.txt"
   File "${SRCDIR}\THIRD-PARTY.txt"
+  ; Intel RealSense runtime (depth cameras); absent in some dev builds.
+  File /nonfatal "${SRCDIR}\realsense2.dll"
+  File /nonfatal "${SRCDIR}\LICENSE-librealsense.txt"
+  File /nonfatal "${SRCDIR}\NOTICE-librealsense.txt"
 
   ; Virtual camera DLLs live in a per-build folder: apps that currently have
   ; the camera open keep the old DLL loaded, so we never overwrite it.
@@ -157,6 +161,9 @@ Section "Uninstall"
   Delete "$INSTDIR\uninstall.exe"
   Delete "$INSTDIR\LICENSE.txt"
   Delete "$INSTDIR\THIRD-PARTY.txt"
+  Delete "$INSTDIR\realsense2.dll"
+  Delete "$INSTDIR\LICENSE-librealsense.txt"
+  Delete "$INSTDIR\NOTICE-librealsense.txt"
   RMDir /r /REBOOTOK "$INSTDIR\vcam"
   RMDir "$INSTDIR"
   DeleteRegKey HKCU "${UNINST_KEY}"

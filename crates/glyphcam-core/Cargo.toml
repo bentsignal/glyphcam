@@ -10,9 +10,7 @@ anyhow.workspace = true
 log.workspace = true
 serde.workspace = true
 parking_lot.workspace = true
+serde_json.workspace = true
 tract-onnx = "0.23"
 fontdue = "0.9"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
-
-[dev-dependencies]
-serde_json.workspace = true

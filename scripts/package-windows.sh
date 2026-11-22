@@ -21,6 +21,18 @@ cp target/i686-pc-windows-msvc/release/glyphcam_vcam.dll dist/stage/glyphcam-vca
 cp target/release/glyphcam_mfcam.dll dist/stage/glyphcam-mfcam.dll
 cp LICENSE dist/stage/LICENSE.txt
 cp THIRD-PARTY.md dist/stage/THIRD-PARTY.txt
+# Intel RealSense depth camera support (scripts/build-realsense.cmd).
+# Required for release builds; dev builds may skip it.
+RS=third_party/realsense
+if [ -f "$RS/realsense2.dll" ]; then
+  cp "$RS/realsense2.dll" dist/stage/
+  cp "$RS/LICENSE-librealsense.txt" "$RS/NOTICE-librealsense.txt" dist/stage/
+elif [ "$GLYPHCAM_CHANNEL" != "dev" ]; then
+  echo "missing $RS/realsense2.dll (run scripts/build-realsense.cmd)" >&2
+  exit 1
+else
+  echo "note: no realsense2.dll, depth camera support not packaged" >&2
+fi
 
 OUT="dist/glyphcam-${LABEL}-windows-x64-setup.exe"
 winpath() { if command -v cygpath >/dev/null; then cygpath -w "$1"; else echo "$1"; fi; }

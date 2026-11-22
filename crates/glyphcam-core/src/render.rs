@@ -4,9 +4,10 @@
 //! atlas. No text layout happens per frame; the hot loop is a byte blend.
 
 use crate::color::{Palette, Rgb};
+use crate::depth::DepthField;
 use crate::glyphs::{Atlas, AtlasKey, LEVELS};
 use crate::image::{Frame, RgbImage};
-use crate::settings::{Background, ColorMode, Settings};
+use crate::settings::{Background, ColorMode, DepthMode, Settings};
 use crate::stabilize::FrameXf;
 use crate::track::{Face, Mask};
 
@@ -152,6 +153,16 @@ fn matmul(a: [[f32; 3]; 3], b: [[f32; 3]; 3]) -> [[f32; 3]; 3] {
 pub struct TrackView<'a> {
     pub face: Option<&'a Face>,
     pub mask: Option<&'a Mask>,
+    /// Real 3D surface from a depth camera (replaces the head guess).
+    pub depth: Option<&'a DepthField>,
+}
+
+/// One line segment in output pixels, with a brightness.
+#[derive(Clone, Copy)]
+struct Edge {
+    a: [f32; 2],
+    b: [f32; 2],
+    v: f32,
 }
 
 pub struct Renderer {
@@ -165,6 +176,13 @@ pub struct Renderer {
     glyph_idx: Vec<u16>,
     fg: Vec<[u8; 3]>,
     bg: Vec<[u8; 3]>,
+    /// Per-cell depth in metres from the depth camera (0 = none).
+    cell_z: Vec<f32>,
+    edges: Vec<Edge>,
+    /// Wrapped look: per skin-cell accumulators, glyphs and colours.
+    wacc: Vec<[f32; 5]>,
+    wglyph: Vec<u16>,
+    wfg: Vec<[u8; 3]>,
     rng: u32,
 }
 
@@ -205,6 +223,11 @@ impl Renderer {
             glyph_idx: Vec::new(),
             fg: Vec::new(),
             bg: Vec::new(),
+            cell_z: Vec::new(),
+            wacc: Vec::new(),
+            wglyph: Vec::new(),
+            wfg: Vec::new(),
+            edges: Vec::new(),
             rng: 0x1234_5678,
         }
     }
@@ -253,9 +276,17 @@ impl Renderer {
         self.glyph_idx.resize(n, 0);
         self.fg.resize(n, [0; 3]);
         self.bg.resize(n, [0; 3]);
+        self.cell_z.resize(n, 0.0);
 
         // ---- 1. sample camera, mask and head model per cell ----
-        let head = track.face.map(HeadModel::new);
+        let field = track.depth.filter(|f| f.valid);
+        let head = if field.is_some() {
+            None
+        } else {
+            track.face.map(HeadModel::new)
+        };
+        let t = time as f32;
+        let light = depth_light(s, t);
         let (sw, sh) = src
             .map(|i| (i.width as f32, i.height as f32))
             .unwrap_or((1.0, 1.0));
@@ -305,6 +336,36 @@ impl Renderer {
                         }
                     }
                 };
+                if let Some(f) = field {
+                    // Real surface from the depth camera.
+                    match f.surface(p[0], p[1]).filter(|_| in_frame) {
+                        Some(sf) => {
+                            let lit = dot3(sf.n, light).clamp(0.0, 1.0);
+                            let near = 1.0 - ((sf.z - f.z_ref + 0.06) / 0.3).clamp(0.0, 1.0);
+                            cell.shade = 0.3 * near + 0.7 * lit;
+                            cell.alpha = sf.subject;
+                            // expose for the face, not a bright shirt at
+                            // the same depth
+                            let near_face = match track.face {
+                                Some(fc) => {
+                                    (p[0] - fc.cx).abs() < fc.w * 0.7
+                                        && (p[1] - fc.cy).abs() < fc.h * 0.9
+                                }
+                                None => true,
+                            };
+                            cell.in_head = sf.subject > 0.5 && sf.z < f.z_ref + 0.12 && near_face;
+                            self.cell_z[gy * cols + gx] = sf.z;
+                        }
+                        None => {
+                            cell.shade = 0.3;
+                            cell.alpha = 0.0;
+                            cell.in_head = false;
+                            self.cell_z[gy * cols + gx] = 0.0;
+                        }
+                    }
+                    continue;
+                }
+                self.cell_z[gy * cols + gx] = 0.0;
                 match head.as_ref().and_then(|h| h.eval(p[0], p[1])) {
                     Some((depth, shade)) => {
                         cell.in_head = true;
@@ -373,6 +434,19 @@ impl Renderer {
             for i in 0..n {
                 self.inten[i] =
                     (self.inten[i] + (self.inten[i] - self.tmp[i]) * s.edge * 1.6).clamp(0.0, 1.0);
+            }
+        }
+
+        // ---- 3b. ridgelines: faint glyph face under lifted scan lines ----
+        self.edges.clear();
+        if let Some(f) = field {
+            if s.depth_mode == DepthMode::Ridges {
+                build_ridges(f, track.face, xf, s, t, light, &mut self.edges);
+                for i in 0..n {
+                    if self.cell_z[i] > 0.0 {
+                        self.inten[i] *= s.depth_fill;
+                    }
+                }
             }
         }
 
@@ -462,7 +536,6 @@ impl Renderer {
         );
         let bgc = palette.bg;
         let atlas = &self.atlas.as_ref().unwrap().1;
-        let t = time as f32;
         for gy in 0..rows {
             let yn = gy as f32 / rows.max(1) as f32;
             for gx in 0..cols {
@@ -553,6 +626,243 @@ impl Renderer {
                 }
             }
         }
+        if field.is_some() && s.depth_mode == DepthMode::Ridges {
+            self.draw_wire(s, out);
+        }
+        if let (Some(f), Some(img), DepthMode::Wrapped) = (field, src, s.depth_mode) {
+            self.render_wrapped(f, img, xf, s, t, out);
+        }
+    }
+
+    /// Repaint the person with glyphs laid out on the skin itself: the glyph
+    /// grid lives in surface coordinates (arc length over the face, from
+    /// [`DepthField::build_uv`]), so glyphs foreshorten and wrap with the 3D
+    /// shape instead of sitting on a flat screen grid. The background stays
+    /// as the normal 2D render underneath.
+    fn render_wrapped(
+        &mut self,
+        f: &DepthField,
+        img: &RgbImage,
+        xf: &FrameXf,
+        s: &Settings,
+        t: f32,
+        out: &mut Frame,
+    ) {
+        let Some(intr) = f.intrinsics() else { return };
+        let g = grid_for(s);
+        let (cw, ch) = (g.cell_w, g.cell_h);
+        // glyph size on the skin: the 2D cell size, measured at face depth
+        let [a, b, c, d] = xf.a;
+        let det = a * d - b * c;
+        let scale = det.abs().sqrt();
+        let cw_m = cw as f32 * scale * f.z_ref / intr.fx;
+        let ch_m = ch as f32 * scale * f.z_ref / intr.fy;
+        if cw_m <= 0.0 || ch_m <= 0.0 {
+            return;
+        }
+        // mirrored output: flip u so glyphs read the right way round
+        let mu = if det < 0.0 { -1.0 } else { 1.0 };
+        const NU: i32 = 160;
+        const NV: i32 = 120;
+        let (gu, gv) = ((2 * NU) as usize, (2 * NV) as usize);
+        let cells = gu * gv;
+        let cell_of = |u: f32, v: f32| -> Option<(usize, f32, f32)> {
+            let uu = u * mu / cw_m;
+            let vv = v / ch_m;
+            let iu = uu.floor() as i32;
+            let iv = vv.floor() as i32;
+            ((-NU..NU).contains(&iu) && (-NV..NV).contains(&iv)).then(|| {
+                (
+                    (iv + NV) as usize * gu + (iu + NU) as usize,
+                    uu - iu as f32,
+                    vv - iv as f32,
+                )
+            })
+        };
+
+        // pass 1: average tone and colour of the skin under each glyph
+        self.wacc.clear();
+        self.wacc.resize(cells, [0.0; 5]);
+        let light = depth_light(s, t);
+        let (lo, hi) = self.exposure;
+        let inv = 1.0 / (hi - lo).max(0.05);
+        let (sw, sh) = (img.width, img.height);
+        for y in (0..sh).step_by(2) {
+            for x in (0..sw).step_by(2) {
+                let (fx, fy) = (x as f32 + 1.0, y as f32 + 1.0);
+                let Some((u, v, sub)) = f.uv(fx, fy) else {
+                    continue;
+                };
+                if sub < 0.5 {
+                    continue;
+                }
+                let Some((ci, _, _)) = cell_of(u, v) else {
+                    continue;
+                };
+                let px = img.get(x, y);
+                let lum =
+                    (0.299 * px[0] as f32 + 0.587 * px[1] as f32 + 0.114 * px[2] as f32) / 255.0;
+                let shade = f
+                    .surface(fx, fy)
+                    .map(|sf| {
+                        let lit = dot3(sf.n, light).clamp(0.0, 1.0);
+                        let near = 1.0 - ((sf.z - f.z_ref + 0.06) / 0.3).clamp(0.0, 1.0);
+                        0.3 * near + 0.7 * lit
+                    })
+                    .unwrap_or(0.5);
+                let mut tv = ((lum - lo) * inv).clamp(0.0, 1.2);
+                tv = (tv - 0.5) * s.contrast + 0.5 + s.brightness;
+                tv = tv.clamp(0.0, 1.0).powf(s.gamma);
+                tv *= 1.0 + ((0.25 + 0.95 * shade) - 1.0) * s.depth;
+                let acc = &mut self.wacc[ci];
+                acc[0] += tv;
+                acc[1] += px[0] as f32;
+                acc[2] += px[1] as f32;
+                acc[3] += px[2] as f32;
+                acc[4] += 1.0;
+            }
+        }
+
+        // pick a glyph and colour per skin cell
+        let palette = Palette::new(s.color_mode, s.custom_fg, s.custom_bg, s.saturation);
+        let atlas = &self.atlas.as_ref().unwrap().1;
+        self.wglyph.clear();
+        self.wglyph.resize(cells, 0);
+        self.wfg.clear();
+        self.wfg.resize(cells, [0; 3]);
+        for i in 0..cells {
+            let acc = self.wacc[i];
+            if acc[4] == 0.0 {
+                continue;
+            }
+            let k = 1.0 / acc[4];
+            let v = (acc[0] * k).clamp(0.0, 1.0);
+            let level = ((v * (LEVELS - 1) as f32).round() as usize).min(LEVELS - 1);
+            let level = if v < 0.045 { 0 } else { level.max(1) };
+            let cands = &atlas.levels[level];
+            let id = i as u32;
+            let slot = (t * s.churn * (0.4 + hash01(id)) + hash01(id ^ 0xABCD) * 97.0) as u32;
+            self.wglyph[i] = cands[(hash2(id, slot) as usize) % cands.len()];
+            let yn = (i / gu) as f32 / gv as f32;
+            let fg = palette.color(v, [acc[1] * k, acc[2] * k, acc[3] * k], yn);
+            self.wfg[i] = [
+                fg[0].min(255.0) as u8,
+                fg[1].min(255.0) as u8,
+                fg[2].min(255.0) as u8,
+            ];
+        }
+
+        // pass 2: repaint every person pixel from its skin cell (all cores)
+        let bgc = palette.bg;
+        let bg = [bgc[0] as i32, bgc[1] as i32, bgc[2] as i32];
+        let (glyphs, fgs) = (&self.wglyph, &self.wfg);
+        let w = out.width as usize;
+        let rows = out.height as usize;
+        let threads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+            .clamp(1, 16);
+        let band = rows.div_ceil(threads);
+        std::thread::scope(|scope| {
+            for (k, chunk) in out.data.chunks_mut(band * w * 4).enumerate() {
+                let cell_of = &cell_of;
+                scope.spawn(move || {
+                    let y0 = k * band;
+                    for (ry, row) in chunk.chunks_exact_mut(w * 4).enumerate() {
+                        let y = (y0 + ry) as f32 + 0.5;
+                        for x in 0..w {
+                            let p = xf.map(x as f32 + 0.5, y);
+                            let Some((u, v, sub)) = f.uv(p[0], p[1]) else {
+                                continue;
+                            };
+                            if sub < 0.5 {
+                                continue;
+                            }
+                            let px = &mut row[x * 4..x * 4 + 4];
+                            let Some((ci, fu, fv)) = cell_of(u, v) else {
+                                continue;
+                            };
+                            let gidx = glyphs[ci];
+                            let a = if gidx == 0 {
+                                0
+                            } else {
+                                let gx = ((fu * cw as f32) as usize).min(cw - 1);
+                                let gy = ((fv * ch as f32) as usize).min(ch - 1);
+                                atlas.glyph(gidx)[gy * cw + gx] as i32
+                            };
+                            let fg = fgs[ci];
+                            let mix =
+                                |b: i32, f: u8| (b + (((f as i32 - b) * a + 127) / 255)) as u8;
+                            px[0] = mix(bg[2], fg[2]);
+                            px[1] = mix(bg[1], fg[1]);
+                            px[2] = mix(bg[0], fg[0]);
+                            px[3] = 255;
+                        }
+                    }
+                });
+            }
+        });
+    }
+
+    /// Draw ridgelines on top of the glyphs (additive, slightly soft).
+    fn draw_wire(&self, s: &Settings, out: &mut Frame) {
+        let palette = Palette::new(s.color_mode, s.custom_fg, s.custom_bg, s.saturation);
+        let (w, h) = (out.width as i32, out.height as i32);
+        let thick = (out.height as f32 / 720.0).max(0.75);
+        let data = &mut out.data;
+        let mut plot = |x: f32, y: f32, c: [f32; 3], a: f32| {
+            // 2x2 bilinear splat, additive
+            let x0 = (x - 0.5).floor();
+            let y0 = (y - 0.5).floor();
+            let tx = x - 0.5 - x0;
+            let ty = y - 0.5 - y0;
+            for (dx, dy, k) in [
+                (0, 0, (1.0 - tx) * (1.0 - ty)),
+                (1, 0, tx * (1.0 - ty)),
+                (0, 1, (1.0 - tx) * ty),
+                (1, 1, tx * ty),
+            ] {
+                let px = x0 as i32 + dx;
+                let py = y0 as i32 + dy;
+                if px < 0 || py < 0 || px >= w || py >= h {
+                    continue;
+                }
+                let i = ((py * w + px) * 4) as usize;
+                let a = a * k;
+                data[i] = (data[i] as f32 + c[2] * a).min(255.0) as u8;
+                data[i + 1] = (data[i + 1] as f32 + c[1] * a).min(255.0) as u8;
+                data[i + 2] = (data[i + 2] as f32 + c[0] * a).min(255.0) as u8;
+            }
+        };
+        let passes: &[f32] = if thick > 1.2 { &[-0.5, 0.5] } else { &[0.0] };
+        for e in &self.edges {
+            let yn = (e.a[1] / h as f32).clamp(0.0, 1.0);
+            let c = palette.color(e.v.max(0.6), [235.0, 245.0, 255.0], yn);
+            let dx = e.b[0] - e.a[0];
+            let dy = e.b[1] - e.a[1];
+            let len = (dx * dx + dy * dy).sqrt();
+            let steps = (len * 1.5).ceil().max(1.0) as usize;
+            let (nx, ny) = if len > 0.0 {
+                (-dy / len, dx / len)
+            } else {
+                (0.0, 0.0)
+            };
+            for k in 0..=steps {
+                let f = k as f32 / steps as f32;
+                for &o in passes {
+                    plot(
+                        e.a[0] + dx * f + nx * o * thick,
+                        e.a[1] + dy * f + ny * o * thick,
+                        c,
+                        0.55 * e.v,
+                    );
+                }
+            }
+            // vertex sparkle
+            for p in [e.a, e.b] {
+                plot(p[0], p[1], c, 0.35);
+            }
+        }
     }
 
     fn respawn(&mut self, x: usize, rows: usize, from_top: bool) {
@@ -564,6 +874,94 @@ impl Renderer {
             self.rand() * rows as f32 * 1.5 - rows as f32 * 0.5
         };
         self.drops[x] = Drop { head, speed, len };
+    }
+}
+
+#[inline]
+fn dot3(a: [f32; 3], b: [f32; 3]) -> f32 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+
+/// Light direction for depth shading, in camera space and pointing at the
+/// light from the surface, with the same sign convention as surface normals
+/// (n.z < 0 faces the camera). Ridgelines swing it slowly with the hologram
+/// setting; relief keeps it still.
+fn depth_light(s: &Settings, t: f32) -> [f32; 3] {
+    let swing = if s.depth_mode == DepthMode::Ridges {
+        s.holo
+    } else {
+        0.0
+    };
+    let a = swing * 0.9 * (t * 0.6).sin();
+    let (sa, ca) = a.sin_cos();
+    let l = [-0.42f32, -0.5, -0.76];
+    let l = [l[0] * ca + l[2] * sa, l[1], -l[0] * sa + l[2] * ca];
+    let len = dot3(l, l).sqrt();
+    [l[0] / len, l[1] / len, l[2] / len]
+}
+
+/// Horizontal scan lines across the person, each point lifted toward the top
+/// of the frame by how far it sticks out toward the camera.
+fn build_ridges(
+    f: &DepthField,
+    face: Option<&Face>,
+    xf: &FrameXf,
+    s: &Settings,
+    t: f32,
+    light: [f32; 3],
+    edges: &mut Vec<Edge>,
+) {
+    let Some(intr) = f.intrinsics() else { return };
+    let (sw, sh) = f.source_size();
+    let size = face.map(|fc| fc.w).unwrap_or(sw * 0.25);
+    let cy = face.map(|fc| fc.cy).unwrap_or(sh * 0.4);
+    let rh = (size * (0.12 + (0.035 - 0.12) * s.mesh_detail)).max(3.0);
+    let step = (rh * 0.4).max(2.0);
+    // pixels of lift per metre of relief, so a nose reads clearly
+    let gain = intr.fy / f.z_ref.max(0.2) * (0.35 + 0.35 * s.holo);
+    // relief is measured from just behind the face plane and capped, so
+    // the head doesn't float away and the chest doesn't climb over the face
+    let back = f.z_ref + 0.04;
+    let epoch = (t * (2.0 + 10.0 * s.glitch)) as u32;
+    let first = cy - (cy / rh).floor() * rh;
+    let mut y = first;
+    let mut row = 0u32;
+    while y < sh {
+        // glitch: a row now and then jumps sideways or drops out
+        let rid = hash2(row, epoch);
+        let shift = if s.glitch > 0.0 && hash01(rid) < s.glitch * 0.12 {
+            (hash01(rid ^ 0x55) - 0.5) * size * 0.4
+        } else {
+            0.0
+        };
+        let wave = s.holo * 0.004 * (t * 1.7 + row as f32 * 0.6).sin();
+        let mut prev: Option<([f32; 2], f32, f32)> = None;
+        let mut x = 0.0;
+        while x < sw {
+            let pt = f.surface(x, y).filter(|sf| sf.subject > 0.5).map(|sf| {
+                let lift = ((back - sf.z).clamp(0.0, 0.1) + wave) * gain;
+                let lit = dot3(sf.n, light).clamp(0.0, 1.0);
+                let near = 1.0 - ((sf.z - f.z_ref + 0.06) / 0.3).clamp(0.0, 1.0);
+                (
+                    xf.unmap(x + shift, y - lift),
+                    sf.z,
+                    0.35 + 0.65 * (0.5 * lit + 0.5 * near),
+                )
+            });
+            if let (Some(a), Some(b)) = (prev, pt) {
+                if (a.1 - b.1).abs() < 0.04 {
+                    edges.push(Edge {
+                        a: a.0,
+                        b: b.0,
+                        v: 0.5 * (a.2 + b.2),
+                    });
+                }
+            }
+            prev = pt;
+            x += step;
+        }
+        y += rh;
+        row += 1;
     }
 }
 

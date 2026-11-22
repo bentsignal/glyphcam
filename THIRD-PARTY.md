@@ -10,6 +10,12 @@ glyphcam bundles the following assets. Their licenses are included in
 | `assets/fonts/DejaVuSansMono.ttf`, `glyphcam-braille.ttf` (subset of DejaVu Sans) | [DejaVu fonts](https://dejavu-fonts.github.io/) | Bitstream Vera / DejaVu license (`assets/fonts/LICENSE-DejaVu.txt`) |
 | `assets/fonts/glyphcam-kana.ttf` (half-width katakana subset of Noto Sans JP, weight 500) | [Noto Sans JP](https://fonts.google.com/noto/specimen/Noto+Sans+JP) | SIL Open Font License 1.1 (`assets/fonts/LICENSE-NotoSansJP-OFL.txt`) |
 
+The Windows build also ships `realsense2.dll`, Intel RealSense SDK
+([librealsense](https://github.com/IntelRealSense/librealsense) v2.48.0,
+Apache-2.0), for depth cameras. It is built from source by
+`scripts/build-realsense.cmd`; its license and notice files are installed
+next to it (`LICENSE-librealsense.txt`, `NOTICE-librealsense.txt`).
+
 Rust crate dependencies are listed in `Cargo.lock`; notable ones include
 `tract` (MIT/Apache-2.0), `egui`/`eframe` (MIT/Apache-2.0), `nokhwa`
 (Apache-2.0), `tray-icon` (MIT/Apache-2.0) and `windows` (MIT/Apache-2.0).

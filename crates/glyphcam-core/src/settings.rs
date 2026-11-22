@@ -43,6 +43,41 @@ impl ColorMode {
     }
 }
 
+/// What a depth camera does to the picture (ignored without depth data).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub enum DepthMode {
+    /// Glyphs lit by the real shape of your face.
+    Relief,
+    /// Horizontal lines lifted by your face's depth.
+    Ridges,
+    /// Glyphs laid out on your skin in 3D, wrapping around your face.
+    Wrapped,
+}
+
+impl<'de> Deserialize<'de> for DepthMode {
+    /// Unknown names (looks that were removed) fall back to Relief instead
+    /// of failing, which would reset every other setting too.
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let name = String::deserialize(d)?;
+        Ok(match name.as_str() {
+            "Ridges" => DepthMode::Ridges,
+            "Wrapped" => DepthMode::Wrapped,
+            _ => DepthMode::Relief,
+        })
+    }
+}
+
+impl DepthMode {
+    pub const ALL: [DepthMode; 3] = [DepthMode::Relief, DepthMode::Ridges, DepthMode::Wrapped];
+    pub fn label(self) -> &'static str {
+        match self {
+            DepthMode::Relief => "Relief (lit by your real face)",
+            DepthMode::Ridges => "Ridgelines",
+            DepthMode::Wrapped => "Wrapped (3D glyphs on your face)",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Background {
     /// Render the whole camera image as glyphs.
@@ -199,6 +234,8 @@ pub enum SourceKind {
     Demo,
     /// A still image with simulated head motion (for testing tracking).
     Image(String),
+    /// A recorded colour + depth clip (folder with meta.json), looped.
+    DepthRecording(String),
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -242,6 +279,17 @@ pub struct Settings {
     pub bg_dim: f32,
     pub rain_speed: f32,
 
+    // --- depth camera ---
+    pub depth_mode: DepthMode,
+    /// Mesh / contour density (0 = big polygons, 1 = fine).
+    pub mesh_detail: f32,
+    /// How much of the normal glyph face shows under lines (0..1).
+    pub depth_fill: f32,
+    /// Hologram wobble: the 3D mesh turns a little and the light moves (0..1).
+    pub holo: f32,
+    /// Vertex jitter and flicker (0..1).
+    pub glitch: f32,
+
     // --- framing ---
     pub stabilize: bool,
     /// Face height as a fraction of output height.
@@ -282,12 +330,12 @@ impl Default for Settings {
             out_width: 1280,
             out_height: 720,
             fps: 30,
-            color_mode: ColorMode::Matrix,
+            color_mode: ColorMode::Ice,
             custom_fg: [255, 64, 200],
             custom_bg: [6, 0, 12],
             scripts: Scripts::default(),
             mirror_katakana: true,
-            columns: 128,
+            columns: 76,
             auto_exposure: true,
             contrast: 1.15,
             brightness: 0.0,
@@ -297,9 +345,14 @@ impl Default for Settings {
             glow: 0.45,
             churn: 0.6,
             saturation: 1.3,
-            background: Background::Rain,
+            background: Background::Dim,
             bg_dim: 0.25,
             rain_speed: 1.0,
+            depth_mode: DepthMode::Relief,
+            mesh_detail: 0.45,
+            depth_fill: 0.4,
+            holo: 0.4,
+            glitch: 0.35,
             stabilize: true,
             face_size: 0.5,
             sway: 0.45,
@@ -345,6 +398,10 @@ impl Settings {
         self.saturation = self.saturation.clamp(0.0, 3.0);
         self.bg_dim = self.bg_dim.clamp(0.0, 1.0);
         self.rain_speed = self.rain_speed.clamp(0.1, 4.0);
+        self.mesh_detail = self.mesh_detail.clamp(0.0, 1.0);
+        self.depth_fill = self.depth_fill.clamp(0.0, 1.0);
+        self.holo = self.holo.clamp(0.0, 1.0);
+        self.glitch = self.glitch.clamp(0.0, 1.0);
         self.face_size = self.face_size.clamp(0.15, 0.9);
         self.sway = self.sway.clamp(0.0, 1.0);
         self.tilt = self.tilt.clamp(0.0, 1.0);

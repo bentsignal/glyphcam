@@ -5,10 +5,11 @@
 //! stream client), so the webcam light stays off when idle.
 
 use crate::camera::{self, CameraDevice, CaptureHandle};
+use crate::realsense::{self, RealSenseCapture};
 use crate::stream::StreamServer;
 use crate::vcam::{VcamOutput, WriterState};
 use glyphcam_core::settings::SourceKind;
-use glyphcam_core::source::{DemoSource, ImageSource, SourceFrame};
+use glyphcam_core::source::{DemoSource, DepthRecordingSource, ImageSource, SourceFrame};
 use glyphcam_core::{Pipeline, Settings};
 use parking_lot::{Mutex, RwLock};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -23,6 +24,10 @@ pub struct Status {
     pub source_detail: String,
     pub fps: f32,
     pub face: bool,
+    /// Depth data is coming in (depth camera or recording).
+    pub depth: bool,
+    /// Distance to the face from the depth camera, metres.
+    pub depth_m: f32,
     pub detect_ms: f32,
     pub segment_ms: f32,
     pub render_ms: f32,
@@ -100,8 +105,16 @@ enum Source {
         last_seq: u64,
         opened: Instant,
     },
+    /// Intel RealSense: colour plus aligned depth.
+    RealSense {
+        dev: CameraDevice,
+        cap: RealSenseCapture,
+        last_seq: u64,
+        opened: Instant,
+    },
     Demo(DemoSource),
     Image(String, ImageSource),
+    Recording(String, DepthRecordingSource),
 }
 
 fn run(sh: Arc<Shared>) {
@@ -168,7 +181,7 @@ fn run(sh: Arc<Shared>) {
             || last_list.elapsed() > Duration::from_secs(30)
         {
             // Don't re-enumerate every 30 s while a camera is streaming.
-            if !matches!(source, Source::Camera { .. })
+            if !matches!(source, Source::Camera { .. } | Source::RealSense { .. })
                 || last_list.elapsed() > Duration::from_secs(3600)
             {
                 *sh.cameras.lock() = camera::list();
@@ -211,7 +224,10 @@ fn run(sh: Arc<Shared>) {
         if demand {
             last_demand = Instant::now();
         }
-        if !demand && matches!(source, Source::Camera { .. }) && last_demand.elapsed() < LINGER {
+        if !demand
+            && matches!(source, Source::Camera { .. } | Source::RealSense { .. })
+            && last_demand.elapsed() < LINGER
+        {
             // Standby: camera stays open, nothing is rendered.
             vcam.set_state(if s.vcam_enabled {
                 WriterState::Starting
@@ -248,6 +264,10 @@ fn run(sh: Arc<Shared>) {
                 *quality == s.camera_quality
                     && name.as_ref().map(|n| n == &dev.name).unwrap_or(true)
             }
+            (SourceKind::Camera(name), Source::RealSense { dev, .. }) => {
+                name.as_ref().map(|n| n == &dev.name).unwrap_or(true)
+            }
+            (SourceKind::DepthRecording(p), Source::Recording(q, _)) => p == q,
             (SourceKind::Demo, Source::Demo(_)) => true,
             (SourceKind::Image(p), Source::Image(q, _)) => p == q,
             _ => false,
@@ -265,6 +285,17 @@ fn run(sh: Arc<Shared>) {
                         }
                         .or_else(|| camera::preferred_default(&cams));
                         match dev {
+                            Some(dev)
+                                if realsense::is_realsense(&dev.name) && realsense::available() =>
+                            {
+                                log::info!("{} is a RealSense: streaming colour + depth", dev.name);
+                                source = Source::RealSense {
+                                    dev,
+                                    cap: RealSenseCapture::start(),
+                                    last_seq: 0,
+                                    opened: Instant::now(),
+                                };
+                            }
                             Some(dev) => {
                                 let cap = CaptureHandle::start(dev.clone(), s.camera_quality);
                                 source = Source::Camera {
@@ -289,6 +320,13 @@ fn run(sh: Arc<Shared>) {
                 SourceKind::Image(p) => match ImageSource::open(p, 640, 480) {
                     Ok(src) => source = Source::Image(p.clone(), src),
                     Err(e) => sh.status.lock().error = Some(format!("{e:#}")),
+                },
+                SourceKind::DepthRecording(p) => match DepthRecordingSource::open(p) {
+                    Ok(src) => source = Source::Recording(p.clone(), src),
+                    Err(e) => {
+                        sh.status.lock().error = Some(format!("{e:#}"));
+                        std::thread::sleep(Duration::from_millis(200));
+                    }
                 },
             }
         }
@@ -331,6 +369,7 @@ fn run(sh: Arc<Shared>) {
                             image: img,
                             face_hint: None,
                             mask_hint: None,
+                            depth: None,
                         })
                     }
                     None => {
@@ -345,6 +384,65 @@ fn run(sh: Arc<Shared>) {
                     }
                 }
             }
+            Source::RealSense {
+                dev,
+                cap,
+                last_seq,
+                opened,
+            } => {
+                if let Some(err) = cap.error() {
+                    {
+                        let mut st = sh.status.lock();
+                        st.error = Some(err);
+                        st.active = false;
+                    }
+                    vcam.set_state(WriterState::NoCamera);
+                    source = Source::None;
+                    camera_retry_at = Instant::now() + Duration::from_secs(3);
+                    continue;
+                }
+                match cap.next_frame(*last_seq, Duration::from_millis(150)) {
+                    Some((seq, f)) => {
+                        *last_seq = seq;
+                        let mut st = sh.status.lock();
+                        st.source = dev.name.clone();
+                        st.source_detail = cap.format_desc.lock().clone();
+                        st.error = None;
+                        Some(SourceFrame {
+                            image: f.image,
+                            face_hint: None,
+                            mask_hint: None,
+                            depth: Some(f.depth),
+                        })
+                    }
+                    None => {
+                        if *last_seq == 0 {
+                            vcam.set_state(WriterState::Starting);
+                            if opened.elapsed() > Duration::from_secs(12) {
+                                sh.status.lock().error =
+                                    Some(format!("{} isn't sending frames", dev.name));
+                            }
+                        }
+                        continue;
+                    }
+                }
+            }
+            Source::Recording(p, src) => match src.frame(t) {
+                Ok(f) => {
+                    let mut st = sh.status.lock();
+                    st.source = "Depth recording".into();
+                    st.source_detail = format!("{p} ({} frames)", src.len());
+                    st.error = None;
+                    drop(st);
+                    Some(f)
+                }
+                Err(e) => {
+                    sh.status.lock().error = Some(format!("{e:#}"));
+                    source = Source::None;
+                    std::thread::sleep(Duration::from_millis(200));
+                    continue;
+                }
+            },
             Source::Demo(d) => {
                 let mut st = sh.status.lock();
                 st.source = "Demo".into();
@@ -365,7 +463,7 @@ fn run(sh: Arc<Shared>) {
 
         // --- pacing ---
         let interval = Duration::from_secs_f32(1.0 / s.fps.max(1) as f32);
-        let synthetic = !matches!(source, Source::Camera { .. });
+        let synthetic = !matches!(source, Source::Camera { .. } | Source::RealSense { .. });
         let now = Instant::now();
         if now < next_due {
             if synthetic {
@@ -424,6 +522,8 @@ fn run(sh: Arc<Shared>) {
         }
         st.active = true;
         st.face = pipeline.stats.face_found;
+        st.depth = pipeline.stats.depth_ok;
+        st.depth_m = pipeline.stats.depth_m;
         st.detect_ms = pipeline.stats.detect_ms;
         st.segment_ms = pipeline.stats.segment_ms;
         st.render_ms = pipeline.stats.render_ms;

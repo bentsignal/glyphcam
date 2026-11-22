@@ -1,6 +1,7 @@
 //! Synthetic frame sources for running without a camera (demo mode,
 //! headless tests and CI).
 
+use crate::depth::DepthMap;
 use crate::image::RgbImage;
 use crate::track::{Face, Mask};
 use anyhow::{Context, Result};
@@ -12,6 +13,8 @@ pub struct SourceFrame {
     pub face_hint: Option<Face>,
     /// Ground-truth person mask for synthetic sources.
     pub mask_hint: Option<Arc<Mask>>,
+    /// Depth aligned to `image` (depth cameras and depth recordings).
+    pub depth: Option<Arc<DepthMap>>,
 }
 
 /// Procedural animated head: moves around, blinks and talks. Provides
@@ -146,6 +149,7 @@ impl DemoSource {
                 h: mh,
                 data: mask,
             })),
+            depth: None,
         }
     }
 }
@@ -205,6 +209,116 @@ impl ImageSource {
             image: Arc::new(out),
             face_hint: None,
             mask_hint: None,
+            depth: None,
         }
+    }
+}
+
+/// A colour + depth clip recorded from a depth camera, played back in a loop.
+///
+/// Folder layout (written by the recorder script): `meta.json` with
+/// `width`, `height`, `fps`, `frames`, `depth_scale_m` and `color_intrinsics`
+/// (`fx`, `fy`, `ppx`, `ppy`); `color/NNNNNN.jpg`; `depth/NNNNNN.png`
+/// (16-bit, aligned to colour, 0 = no reading).
+pub struct DepthRecordingSource {
+    dir: std::path::PathBuf,
+    frames: usize,
+    fps: f32,
+    scale: f32,
+    intr: crate::depth::Intrinsics,
+    cached: Option<(usize, SourceFrame)>,
+}
+
+impl DepthRecordingSource {
+    pub fn open(dir: &str) -> Result<Self> {
+        let dir = std::path::PathBuf::from(dir);
+        let meta: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(dir.join("meta.json"))
+                .with_context(|| format!("no meta.json in {}", dir.display()))?,
+        )?;
+        let num = |v: &serde_json::Value, k: &str| -> Result<f64> {
+            v.get(k)
+                .and_then(|x| x.as_f64())
+                .with_context(|| format!("meta.json: missing {k}"))
+        };
+        let ci = meta
+            .get("color_intrinsics")
+            .context("meta.json: missing color_intrinsics")?;
+        let frames = num(&meta, "frames")? as usize;
+        anyhow::ensure!(frames > 0, "recording has no frames");
+        Ok(Self {
+            frames,
+            fps: num(&meta, "fps")? as f32,
+            scale: num(&meta, "depth_scale_m")? as f32,
+            intr: crate::depth::Intrinsics {
+                fx: num(ci, "fx")? as f32,
+                fy: num(ci, "fy")? as f32,
+                ppx: num(ci, "ppx")? as f32,
+                ppy: num(ci, "ppy")? as f32,
+            },
+            dir,
+            cached: None,
+        })
+    }
+
+    pub fn len(&self) -> usize {
+        self.frames
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.frames == 0
+    }
+
+    pub fn fps(&self) -> f32 {
+        self.fps
+    }
+
+    /// Frame at playback time `t` (seconds), looping.
+    pub fn frame(&mut self, t: f64) -> Result<SourceFrame> {
+        let i = ((t * self.fps as f64) as usize) % self.frames;
+        self.frame_at(i)
+    }
+
+    pub fn frame_at(&mut self, i: usize) -> Result<SourceFrame> {
+        if let Some((j, f)) = &self.cached {
+            if *j == i {
+                return Ok(SourceFrame {
+                    image: f.image.clone(),
+                    face_hint: None,
+                    mask_hint: None,
+                    depth: f.depth.clone(),
+                });
+            }
+        }
+        let cp = self.dir.join("color").join(format!("{i:06}.jpg"));
+        let dp = self.dir.join("depth").join(format!("{i:06}.png"));
+        let c = image::open(&cp)
+            .with_context(|| format!("reading {}", cp.display()))?
+            .to_rgb8();
+        let (w, h) = c.dimensions();
+        let d = image::open(&dp)
+            .with_context(|| format!("reading {}", dp.display()))?
+            .to_luma16();
+        anyhow::ensure!(d.dimensions() == (w, h), "depth/colour size mismatch");
+        let f = SourceFrame {
+            image: Arc::new(RgbImage::from_raw(w, h, c.into_raw()).unwrap()),
+            face_hint: None,
+            mask_hint: None,
+            depth: Some(Arc::new(DepthMap {
+                width: w,
+                height: h,
+                data: d.into_raw(),
+                scale: self.scale,
+                intr: self.intr,
+            })),
+        };
+        let out = SourceFrame {
+            image: f.image.clone(),
+            face_hint: None,
+            mask_hint: None,
+            depth: f.depth.clone(),
+        };
+        self.cached = Some((i, f));
+        Ok(out)
     }
 }

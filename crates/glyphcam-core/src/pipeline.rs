@@ -57,6 +57,11 @@ impl Pipeline {
         &self.frame
     }
 
+    /// The depth camera surface (for tools and tests).
+    pub fn depth_field(&self) -> &DepthField {
+        &self.depth
+    }
+
     /// Process one source frame (or `None` for "no signal") and return the
     /// rendered output.
     pub fn process(&mut self, src: Option<&SourceFrame>, s: &Settings, dt: f32) -> &Frame {
@@ -104,7 +109,7 @@ impl Pipeline {
                         .as_ref()
                         .map(|f| (f.cx, f.cy))
                         .unwrap_or((d.width as f32 * 0.5, d.height as f32 * 0.4));
-                    self.depth.build_uv(cx, cy);
+                    self.depth.build_uv(cx, cy, s.wrap_calm, dt);
                 }
             }
             None => self.depth.clear(),

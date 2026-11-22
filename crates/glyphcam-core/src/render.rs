@@ -183,6 +183,12 @@ pub struct Renderer {
     wacc: Vec<[f32; 5]>,
     wglyph: Vec<u16>,
     wfg: Vec<[u8; 3]>,
+    /// Wrapped look, kept across frames: smoothed tone + colour per skin
+    /// cell (tone < 0 = not seen last frame), the glyph level shown, and the
+    /// smoothed depth that sets glyph size.
+    wprev: Vec<[f32; 4]>,
+    wlev: Vec<u16>,
+    wz: f32,
     rng: u32,
 }
 
@@ -227,6 +233,9 @@ impl Renderer {
             wacc: Vec::new(),
             wglyph: Vec::new(),
             wfg: Vec::new(),
+            wprev: Vec::new(),
+            wlev: Vec::new(),
+            wz: 0.0,
             edges: Vec::new(),
             rng: 0x1234_5678,
         }
@@ -630,7 +639,7 @@ impl Renderer {
             self.draw_wire(s, out);
         }
         if let (Some(f), Some(img), DepthMode::Wrapped) = (field, src, s.depth_mode) {
-            self.render_wrapped(f, img, xf, s, t, out);
+            self.render_wrapped(f, img, xf, s, t, dt, out);
         }
     }
 
@@ -639,6 +648,7 @@ impl Renderer {
     /// [`DepthField::build_uv`]), so glyphs foreshorten and wrap with the 3D
     /// shape instead of sitting on a flat screen grid. The background stays
     /// as the normal 2D render underneath.
+    #[allow(clippy::too_many_arguments)]
     fn render_wrapped(
         &mut self,
         f: &DepthField,
@@ -646,17 +656,28 @@ impl Renderer {
         xf: &FrameXf,
         s: &Settings,
         t: f32,
+        dt: f32,
         out: &mut Frame,
     ) {
         let Some(intr) = f.intrinsics() else { return };
+        let calm = s.wrap_calm.clamp(0.0, 1.0);
+        let dt = dt.clamp(0.0, 0.25);
+        let ease = |tau: f32| 1.0 - (-dt / tau.max(1e-4)).exp();
+        // glyph size follows face distance slowly, or every glyph breathes
+        self.wz = if self.wz > 0.0 && (f.z_ref - self.wz).abs() < 0.25 {
+            self.wz + (f.z_ref - self.wz) * ease(0.1 + 0.8 * calm)
+        } else {
+            f.z_ref
+        };
+        let zr = self.wz;
         let g = grid_for(s);
         let (cw, ch) = (g.cell_w, g.cell_h);
         // glyph size on the skin: the 2D cell size, measured at face depth
         let [a, b, c, d] = xf.a;
         let det = a * d - b * c;
         let scale = det.abs().sqrt();
-        let cw_m = cw as f32 * scale * f.z_ref / intr.fx;
-        let ch_m = ch as f32 * scale * f.z_ref / intr.fy;
+        let cw_m = cw as f32 * scale * zr / intr.fx;
+        let ch_m = ch as f32 * scale * zr / intr.fy;
         if cw_m <= 0.0 || ch_m <= 0.0 {
             return;
         }
@@ -730,21 +751,59 @@ impl Renderer {
         self.wglyph.resize(cells, 0);
         self.wfg.clear();
         self.wfg.resize(cells, [0; 3]);
+        if self.wprev.len() != cells {
+            self.wprev = vec![[-1.0, 0.0, 0.0, 0.0]; cells];
+            self.wlev = vec![0; cells];
+        }
+        let level_of = |v: f32| -> u16 {
+            if v < 0.045 {
+                0
+            } else {
+                ((v * (LEVELS - 1) as f32).round() as usize).clamp(1, LEVELS - 1) as u16
+            }
+        };
+        // Tone and colour ease in over time, and a glyph only changes level
+        // once the tone has clearly moved (hysteresis), so sensor noise
+        // doesn't make every glyph flicker. Calm also slows the shimmer.
+        let k_tone = ease(0.02 + 0.3 * calm);
+        let hyst = 0.5 + 1.5 * calm;
+        let churn = s.churn * (1.0 - 0.8 * calm);
         for i in 0..cells {
             let acc = self.wacc[i];
             if acc[4] == 0.0 {
+                self.wprev[i][0] = -1.0;
                 continue;
             }
             let k = 1.0 / acc[4];
-            let v = (acc[0] * k).clamp(0.0, 1.0);
-            let level = ((v * (LEVELS - 1) as f32).round() as usize).min(LEVELS - 1);
-            let level = if v < 0.045 { 0 } else { level.max(1) };
-            let cands = &atlas.levels[level];
+            let now = [
+                (acc[0] * k).clamp(0.0, 1.0),
+                acc[1] * k,
+                acc[2] * k,
+                acc[3] * k,
+            ];
+            let p = &mut self.wprev[i];
+            if p[0] < 0.0 {
+                *p = now;
+                self.wlev[i] = level_of(now[0]);
+            } else {
+                for j in 0..4 {
+                    p[j] += (now[j] - p[j]) * k_tone;
+                }
+                let target = p[0] * (LEVELS - 1) as f32;
+                if (target - self.wlev[i] as f32).abs() > hyst
+                    || (p[0] < 0.045) != (self.wlev[i] == 0)
+                {
+                    self.wlev[i] = level_of(p[0]);
+                }
+            }
+            let v = p[0];
+            let rgb = [p[1], p[2], p[3]];
+            let cands = &atlas.levels[self.wlev[i] as usize];
             let id = i as u32;
-            let slot = (t * s.churn * (0.4 + hash01(id)) + hash01(id ^ 0xABCD) * 97.0) as u32;
+            let slot = (t * churn * (0.4 + hash01(id)) + hash01(id ^ 0xABCD) * 97.0) as u32;
             self.wglyph[i] = cands[(hash2(id, slot) as usize) % cands.len()];
             let yn = (i / gu) as f32 / gv as f32;
-            let fg = palette.color(v, [acc[1] * k, acc[2] * k, acc[3] * k], yn);
+            let fg = palette.color(v, rgb, yn);
             self.wfg[i] = [
                 fg[0].min(255.0) as u8,
                 fg[1].min(255.0) as u8,
@@ -775,9 +834,12 @@ impl Renderer {
                             let Some((u, v, sub)) = f.uv(p[0], p[1]) else {
                                 continue;
                             };
-                            if sub < 0.5 {
+                            if sub < 0.3 {
                                 continue;
                             }
+                            // soft edge onto the 2D render underneath
+                            let m = ((sub - 0.3) / 0.4).clamp(0.0, 1.0);
+                            let m = (m * m * (3.0 - 2.0 * m) * 256.0) as i32;
                             let px = &mut row[x * 4..x * 4 + 4];
                             let Some((ci, fu, fv)) = cell_of(u, v) else {
                                 continue;
@@ -793,9 +855,12 @@ impl Renderer {
                             let fg = fgs[ci];
                             let mix =
                                 |b: i32, f: u8| (b + (((f as i32 - b) * a + 127) / 255)) as u8;
-                            px[0] = mix(bg[2], fg[2]);
-                            px[1] = mix(bg[1], fg[1]);
-                            px[2] = mix(bg[0], fg[0]);
+                            let over = |old: u8, new: u8| {
+                                ((old as i32 * (256 - m) + new as i32 * m) >> 8) as u8
+                            };
+                            px[0] = over(px[0], mix(bg[2], fg[2]));
+                            px[1] = over(px[1], mix(bg[1], fg[1]));
+                            px[2] = over(px[2], mix(bg[0], fg[0]));
                             px[3] = 255;
                         }
                     }

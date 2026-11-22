@@ -46,12 +46,28 @@ pub struct DepthField {
     z: Vec<f32>,
     /// Person membership 0..1.
     subject: Vec<f32>,
+    /// `subject` softened over neighbours: what callers read.
+    sub_s: Vec<f32>,
+    /// Seconds since each cell last had a depth reading.
+    hold: Vec<f32>,
     raw: Vec<f32>,
     w: Vec<f32>,
     /// Surface coordinates in metres (arc length along the skin from the
     /// face centre); NaN where unknown. Built by [`DepthField::build_uv`].
     su: Vec<f32>,
     sv: Vec<f32>,
+    /// Smoothed curvature part of (su, sv): surface coordinates minus the
+    /// flat, rigid-with-the-anchor part. Kept across frames.
+    ru: Vec<f32>,
+    rv: Vec<f32>,
+    /// Extra-smoothed depth used only for surface coordinates.
+    uz: Vec<f32>,
+    uw: Vec<f32>,
+    /// Smoothed anchor (source pixels) and depth scale for `build_uv`.
+    anchor: [f32; 2],
+    uv_zref: f32,
+    /// `ru`/`rv`/`anchor` hold a previous frame.
+    uv_init: bool,
     tmp_a: Vec<f32>,
     tmp_b: Vec<f32>,
     /// Depth of the face (or nearest surface), metres.
@@ -68,6 +84,10 @@ pub struct DepthField {
 /// so the whole frame gets the background treatment instead of the nearest
 /// chair or desk standing in for you.
 const AWAY_AFTER: f32 = 3.0;
+/// How long a spot keeps its depth after the reading drops out (seconds).
+const HOLD: f32 = 0.4;
+/// How long the cutout takes to let go of a spot (seconds).
+const FADE: f32 = 0.35;
 
 /// Sampled surface at a source pixel.
 #[derive(Clone, Copy, Debug)]
@@ -97,6 +117,7 @@ impl DepthField {
 
     pub fn clear(&mut self) {
         self.valid = false;
+        self.uv_init = false;
         self.z.iter_mut().for_each(|v| *v = 0.0);
     }
 
@@ -114,10 +135,16 @@ impl DepthField {
                 sh: d.height,
                 z: vec![0.0; n],
                 subject: vec![0.0; n],
+                sub_s: vec![0.0; n],
+                hold: vec![0.0; n],
                 raw: vec![0.0; n],
                 w: vec![0.0; n],
                 su: vec![f32::NAN; n],
                 sv: vec![f32::NAN; n],
+                ru: vec![0.0; n],
+                rv: vec![0.0; n],
+                uz: vec![0.0; n],
+                uw: vec![0.0; n],
                 tmp_a: vec![0.0; n],
                 tmp_b: vec![0.0; n],
                 ..Default::default()
@@ -192,6 +219,7 @@ impl DepthField {
                     // the render shows background, not the raw camera
                     self.z.iter_mut().for_each(|v| *v = 0.0);
                     self.subject.iter_mut().for_each(|v| *v = 0.0);
+                    self.sub_s.iter_mut().for_each(|v| *v = 0.0);
                     self.valid = true;
                 } else {
                     self.valid = false;
@@ -238,16 +266,31 @@ impl DepthField {
             false,
         );
 
-        // 5. temporal blend; jumps (you moved) reset immediately
+        // 5. temporal blend; jumps (you moved) reset immediately.
+        // Dark fabric, hair and headphones reflect the sensor's IR poorly, so
+        // their depth drops in and out frame to frame. A spot that loses its
+        // reading keeps its last depth for a moment and then fades out, and
+        // membership comes in fast but leaves slowly, so the cutout doesn't
+        // flicker.
         let a = (dt * 14.0).clamp(0.2, 1.0);
+        let rise = a.max(0.5);
+        let fall = (dt / FADE).clamp(0.0, 1.0);
         for i in 0..n {
             let v = self.raw[i];
+            let p = self.z[i];
             if v <= 0.0 {
-                self.z[i] = 0.0;
-                self.subject[i] = (self.subject[i] - a).max(0.0);
+                self.hold[i] += dt;
+                if p > 0.0 && self.hold[i] > HOLD {
+                    self.subject[i] = (self.subject[i] - fall).max(0.0);
+                    if self.subject[i] <= 0.0 {
+                        self.z[i] = 0.0;
+                    }
+                } else if p <= 0.0 {
+                    self.subject[i] = 0.0;
+                }
                 continue;
             }
-            let p = self.z[i];
+            self.hold[i] = 0.0;
             self.z[i] = if p <= 0.0 || (v - p).abs() > 0.04 {
                 v
             } else {
@@ -255,11 +298,31 @@ impl DepthField {
             };
             // fade the far edge of the band so the cutout isn't a hard wall
             let edge = ((far - v) / 0.08).clamp(0.0, 1.0) * self.present;
-            self.subject[i] = if p <= 0.0 {
+            let cur = self.subject[i];
+            self.subject[i] = if p <= 0.0 && cur <= 0.0 {
                 edge
+            } else if edge > cur {
+                cur + (edge - cur) * rise
             } else {
-                self.subject[i] + (edge - self.subject[i]) * a.max(0.5)
+                cur + (edge - cur) * fall.max(0.08)
             };
+        }
+        // 6. soften the cutout edge over neighbours (read-only copy, so the
+        // blur doesn't build up over time)
+        for gy in 0..gh {
+            for gx in 0..gw {
+                let (mut acc, mut wsum) = (0.0, 0.0);
+                for dy in -1isize..=1 {
+                    for dx in -1isize..=1 {
+                        let x = (gx as isize + dx).clamp(0, gw as isize - 1) as usize;
+                        let y = (gy as isize + dy).clamp(0, gh as isize - 1) as usize;
+                        let w = if dx == 0 && dy == 0 { 4.0 } else { 1.0 };
+                        acc += self.subject[y * gw + x] * w;
+                        wsum += w;
+                    }
+                }
+                self.sub_s[gy * gw + gx] = acc / wsum;
+            }
         }
         self.valid = true;
     }
@@ -324,78 +387,137 @@ impl DepthField {
         Some(Surface {
             z,
             n,
-            subject: self.subject[gy * self.gw + gx],
+            subject: self.sub_s[gy * self.gw + gx],
         })
     }
 
     /// Build surface coordinates: `u` is the arc length along each grid row
-    /// (through x and depth) from the centre column, `v` the arc length down
-    /// each column from the centre row. Laying glyphs out in (u, v) paints
+    /// (through x and depth) from the anchor column, `v` the arc length down
+    /// each column from the anchor row. Laying glyphs out in (u, v) paints
     /// them onto the skin: they foreshorten where the surface turns away and
     /// stretch over the nose. `(cx, cy)` is the anchor in source pixels.
-    pub fn build_uv(&mut self, cx: f32, cy: f32) {
+    ///
+    /// Arc length integrates depth noise, so the result is split into a flat
+    /// part that moves rigidly with the (lightly smoothed) anchor and a
+    /// curvature part that is smoothed in space and time. `calm` (0..1) sets
+    /// how much smoothing; `dt` is the frame time in seconds.
+    pub fn build_uv(&mut self, cx: f32, cy: f32, calm: f32, dt: f32) {
         let (gw, gh) = (self.gw, self.gh);
         if !self.valid || gw == 0 {
             return;
         }
-        let c0 = ((cx / CELL as f32) as usize).min(gw - 1);
-        let r0 = ((cy / CELL as f32) as usize).min(gh - 1);
-        let pt = |f: &Self, gx: usize, gy: usize| -> Option<[f32; 3]> {
-            let z = f.z[gy * gw + gx];
-            (z > 0.0).then(|| {
-                f.unproject(
-                    (gx * CELL) as f32 + CELL as f32 * 0.5,
-                    (gy * CELL) as f32 + CELL as f32 * 0.5,
-                    z,
-                )
-            })
+        let n = gw * gh;
+        let calm = calm.clamp(0.0, 1.0);
+        let dt = dt.clamp(0.0, 0.25);
+        let ease = |tau: f32| 1.0 - (-dt / tau.max(1e-4)).exp();
+        let init = self.uv_init;
+
+        // anchor and depth scale, smoothed (a big jump means a new face: snap)
+        let [px, py] = self.anchor;
+        let jump = (cx - px).hypot(cy - py) > 60.0;
+        let (ax, ay) = if init && !jump {
+            let k = ease(0.02 + 0.2 * calm);
+            (px + (cx - px) * k, py + (cy - py) * k)
+        } else {
+            (cx, cy)
         };
-        // reference point: where the anchor ray meets the face plane
-        let anchor = self.unproject(cx, cy, self.z_ref);
-        // Step length between neighbours: the true 3D distance in the
-        // integration direction (x/z for u, y/z for v); across a depth gap
-        // fall back to the flat distance so coordinates stay continuous.
-        let arc = |a: Option<[f32; 3]>, b: Option<[f32; 3]>, axis: usize, flat: f32| -> f32 {
-            match (a, b) {
-                (Some(a), Some(b)) if (a[2] - b[2]).abs() < 0.04 => {
-                    let d = b[axis] - a[axis];
-                    let dz = b[2] - a[2];
-                    d.signum() * (d * d + dz * dz).sqrt()
-                }
-                _ => flat,
+        self.anchor = [ax, ay];
+        let zr = if init && self.uv_zref > 0.0 {
+            self.uv_zref + (self.z_ref - self.uv_zref) * ease(0.1 + 0.6 * calm)
+        } else {
+            self.z_ref
+        };
+        self.uv_zref = zr;
+
+        // depth smoothed some more, just for the coordinates
+        self.uz.copy_from_slice(&self.z);
+        for i in 0..n {
+            self.uw[i] = if self.z[i] > 0.0 { 1.0 } else { 0.0 };
+        }
+        let passes = 1 + (calm * 3.0).round() as usize;
+        for _ in 0..passes {
+            normalized_blur(
+                &mut self.uz,
+                &mut self.uw,
+                &mut self.tmp_a,
+                &mut self.tmp_b,
+                gw,
+                gh,
+                false,
+            );
+        }
+
+        let (fx, fy) = self.intr.map(|i| (i.fx, i.fy)).unwrap_or((600.0, 600.0));
+        let (mx, my) = (CELL as f32 / fx, CELL as f32 / fy);
+        // one grid step along the skin: lateral size at this depth plus the
+        // depth change (capped so a gap doesn't tear the coordinates); off
+        // the surface, the flat step at face depth
+        let step = |za: f32, zb: f32, m: f32| -> f32 {
+            if za > 0.0 && zb > 0.0 {
+                let d = m * 0.5 * (za + zb);
+                let dz = (zb - za).clamp(-0.03, 0.03);
+                (d * d + dz * dz).sqrt()
+            } else {
+                m * zr
             }
         };
-        let flat_x = CELL as f32 * self.z_ref / self.intr.map(|i| i.fx).unwrap_or(600.0);
-        let flat_y = CELL as f32 * self.z_ref / self.intr.map(|i| i.fy).unwrap_or(600.0);
+        let c0 = ((ax / CELL as f32).max(0.0) as usize).min(gw - 1);
+        let r0 = ((ay / CELL as f32).max(0.0) as usize).min(gh - 1);
+        let centre = |g: usize| (g * CELL) as f32 + CELL as f32 * 0.5;
+        // flat coordinates: rigid with the anchor
+        let flat_u = |gx: usize| (centre(gx) - ax) * zr / fx;
+        let flat_v = |gy: usize| (centre(gy) - ay) * zr / fy;
+
+        let uz = &self.uz;
         for gy in 0..gh {
             let row = gy * gw;
-            let start = pt(self, c0, gy).map(|p| p[0]).unwrap_or(
-                self.unproject((c0 * CELL) as f32 + CELL as f32 * 0.5, 0.0, self.z_ref)[0],
-            ) - anchor[0];
-            self.su[row + c0] = start;
+            self.su[row + c0] = flat_u(c0);
             for gx in c0 + 1..gw {
-                let d = arc(pt(self, gx - 1, gy), pt(self, gx, gy), 0, flat_x);
-                self.su[row + gx] = self.su[row + gx - 1] + d;
+                self.su[row + gx] =
+                    self.su[row + gx - 1] + step(uz[row + gx - 1], uz[row + gx], mx);
             }
             for gx in (0..c0).rev() {
-                let d = arc(pt(self, gx + 1, gy), pt(self, gx, gy), 0, -flat_x);
-                self.su[row + gx] = self.su[row + gx + 1] + d;
+                self.su[row + gx] =
+                    self.su[row + gx + 1] - step(uz[row + gx + 1], uz[row + gx], mx);
             }
         }
         for gx in 0..gw {
-            let start = pt(self, gx, r0).map(|p| p[1]).unwrap_or(
-                self.unproject(0.0, (r0 * CELL) as f32 + CELL as f32 * 0.5, self.z_ref)[1],
-            ) - anchor[1];
-            self.sv[r0 * gw + gx] = start;
+            self.sv[r0 * gw + gx] = flat_v(r0);
             for gy in r0 + 1..gh {
-                let d = arc(pt(self, gx, gy - 1), pt(self, gx, gy), 1, flat_y);
-                self.sv[gy * gw + gx] = self.sv[(gy - 1) * gw + gx] + d;
+                let (a, b) = ((gy - 1) * gw + gx, gy * gw + gx);
+                self.sv[b] = self.sv[a] + step(uz[a], uz[b], my);
             }
             for gy in (0..r0).rev() {
-                let d = arc(pt(self, gx, gy + 1), pt(self, gx, gy), 1, -flat_y);
-                self.sv[gy * gw + gx] = self.sv[(gy + 1) * gw + gx] + d;
+                let (a, b) = ((gy + 1) * gw + gx, gy * gw + gx);
+                self.sv[b] = self.sv[a] - step(uz[a], uz[b], my);
             }
         }
+
+        // smooth the curvature part over time; a large change (you turned
+        // your head) follows faster so glyphs don't swim
+        let k = ease(0.03 + 0.4 * calm);
+        for gy in 0..gh {
+            for gx in 0..gw {
+                let i = gy * gw + gx;
+                let (fu, fv) = (flat_u(gx), flat_v(gy));
+                let nu = self.su[i] - fu;
+                let nv = self.sv[i] - fv;
+                if init {
+                    let du = nu - self.ru[i];
+                    let dv = nv - self.rv[i];
+                    let big = (du.abs().max(dv.abs()) / 0.03).min(1.0);
+                    let kk = k + (1.0 - k) * big * big * 0.6;
+                    self.ru[i] += du * kk;
+                    self.rv[i] += dv * kk;
+                } else {
+                    self.ru[i] = nu;
+                    self.rv[i] = nv;
+                }
+                self.su[i] = fu + self.ru[i];
+                self.sv[i] = fv + self.rv[i];
+            }
+        }
+        self.uv_init = true;
     }
 
     /// Surface coordinates (metres) and membership at a source pixel, or
@@ -423,7 +545,7 @@ impl DepthField {
             if self.z[i] > 0.0 && w > 0.0 {
                 u += self.su[i] * w;
                 v += self.sv[i] * w;
-                s += self.subject[i] * w;
+                s += self.sub_s[i] * w;
                 wsum += w;
             }
         }
@@ -564,6 +686,33 @@ mod tests {
         let p = f.unproject(200.0, 100.0, 0.5);
         let q = f.project(p);
         assert!((q[0] - 200.0).abs() < 1e-3 && (q[1] - 100.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn cutout_holds_through_ir_dropouts() {
+        // dark headphones / hoodie: most of the readings vanish at random
+        // every frame; the person must not flicker in and out
+        let mut f = DepthField::new();
+        let mut seed = 1u32;
+        let mut worst = 1.0f32;
+        for frame in 0..90 {
+            let mut d = sphere(320, 240);
+            for (i, v) in d.data.iter_mut().enumerate() {
+                let x = (i % 320) as i32 - 160;
+                let y = (i / 320) as i32 - 120;
+                seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                // whole 16x16 blocks drop out together, like a dark patch
+                let blk = ((x + 160) / 16 * 31 + (y + 120) / 16 * 17 + frame * 7) % 3;
+                if x * x + y * y < 90 * 90 && x > 20 && (blk == 0 || seed >> 31 == 1) {
+                    *v = 0;
+                }
+            }
+            f.update(&d, None, 1.0 / 30.0);
+            if frame >= 15 {
+                worst = worst.min(f.surface(220.0, 120.0).map(|s| s.subject).unwrap_or(0.0));
+            }
+        }
+        assert!(worst > 0.5, "cutout dropped to {worst}");
     }
 
     #[test]

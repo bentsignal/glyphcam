@@ -31,6 +31,7 @@ const SHARED_KEYS: &[&str] = &[
     "depth_fill",
     "holo",
     "glitch",
+    "wrap_calm",
     "glow",
     "churn",
     "saturation",

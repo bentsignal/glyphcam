@@ -15,9 +15,7 @@ mod ui;
 mod updater;
 mod vcam;
 
-use eframe::egui;
 use std::io::Write;
-use std::sync::Arc;
 
 fn init_logging() {
     init_logging_to("glyphcam.log");
@@ -29,7 +27,7 @@ fn init_logging_to(file: &str) {
     let path = dir.join(file);
     let _ = std::fs::rename(&path, path.with_extension("old.log"));
     let mut b = env_logger::Builder::from_env(
-        env_logger::Env::default().default_filter_or("info,wgpu=warn,eframe=warn"),
+        env_logger::Env::default().default_filter_or("info,gpui=warn,naga=warn"),
     );
     if let Ok(f) = std::fs::File::create(&path) {
         b.target(env_logger::Target::Pipe(Box::new(f)));
@@ -315,31 +313,6 @@ fn main() {
     let engine = engine::spawn(sh.clone());
     let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
 
-    let icon = image::load_from_memory(include_bytes!("../../../assets/icons/glyphcam-256.png"))
-        .map(|i| i.to_rgba8())
-        .ok()
-        .map(|i| {
-            let (w, h) = i.dimensions();
-            Arc::new(egui::IconData {
-                rgba: i.into_raw(),
-                width: w,
-                height: h,
-            })
-        });
-    let mut viewport = egui::ViewportBuilder::default()
-        .with_title("glyphcam")
-        .with_app_id("glyphcam")
-        .with_inner_size([1080.0, 720.0])
-        .with_min_inner_size([780.0, 540.0])
-        .with_visible(!start_hidden || cfg!(target_os = "macos"));
-    if let Some(icon) = icon {
-        viewport = viewport.with_icon(icon);
-    }
-    let options = eframe::NativeOptions {
-        viewport,
-        ..Default::default()
-    };
-
     let show_tx = cmd_tx.clone();
     let sh_for_show = sh.clone();
     platform::listen_for_show(instance, move || {
@@ -357,12 +330,6 @@ fn main() {
         cmd_tx,
         cmd_rx,
     };
-    if let Err(e) = eframe::run_native(
-        "glyphcam",
-        options,
-        Box::new(move |cc| Ok(Box::new(ui::GlyphApp::new(cc, launch)))),
-    ) {
-        log::error!("ui failed: {e}");
-    }
+    ui::run(launch);
     log::info!("glyphcam exiting");
 }

@@ -30,6 +30,7 @@ pub struct Release {
     #[serde(default)]
     pub published_at: Option<String>,
     #[serde(default)]
+    #[allow(dead_code)]
     pub body: Option<String>,
     pub html_url: String,
     #[serde(default)]

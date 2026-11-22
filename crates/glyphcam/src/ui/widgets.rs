@@ -14,6 +14,9 @@ use gpui_kit::component::{
 };
 use std::rc::Rc;
 
+/// Applies the option picked from a dropdown.
+pub type Pick = Rc<dyn Fn(&mut GlyphUi, usize)>;
+
 /// A titled group of settings.
 pub fn card(title: impl Into<SharedString>) -> Div {
     div()
@@ -294,7 +297,7 @@ impl GlyphUi {
         id: &'static str,
         current: impl Into<SharedString>,
         options: Vec<(SharedString, bool)>,
-        pick: Rc<dyn Fn(&mut GlyphUi, usize)>,
+        pick: Pick,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let weak = cx.entity().downgrade();

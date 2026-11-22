@@ -53,7 +53,7 @@ impl Waker {
 
 pub fn run(l: Launch) {
     let app = gpui_kit::application()
-        .with_assets(gpui_kit::assets::AllAssets)
+        .with_assets(UiAssets)
         .with_quit_mode(QuitMode::Explicit);
     // macOS: clicking the Dock icon brings the window back
     let reopen_ui: Rc<RefCell<Option<Entity<GlyphUi>>>> = Rc::default();
@@ -146,6 +146,33 @@ pub fn run(l: Launch) {
         }
     });
     log::info!("ui loop ended");
+}
+
+/// gpui-component's default icon set plus the few extra Lucide icons we use
+/// (the full catalogue is 1,800+ files).
+struct UiAssets;
+
+impl AssetSource for UiAssets {
+    fn load(&self, path: &str) -> Result<Option<std::borrow::Cow<'static, [u8]>>> {
+        let extra: Option<&'static [u8]> = match path {
+            "icons/webcam.svg" => Some(include_bytes!("../../../../assets/ui-icons/webcam.svg")),
+            "icons/download.svg" => {
+                Some(include_bytes!("../../../../assets/ui-icons/download.svg"))
+            }
+            "icons/clipboard-paste.svg" => Some(include_bytes!(
+                "../../../../assets/ui-icons/clipboard-paste.svg"
+            )),
+            _ => None,
+        };
+        match extra {
+            Some(b) => Ok(Some(std::borrow::Cow::Borrowed(b))),
+            None => gpui_kit::assets::Assets.load(path),
+        }
+    }
+
+    fn list(&self, path: &str) -> Result<Vec<SharedString>> {
+        gpui_kit::assets::Assets.list(path)
+    }
 }
 
 /// Open the control panel window around the (long-lived) UI entity.

@@ -469,7 +469,7 @@ impl GlyphUi {
         if open {
             let mut grid = div().grid().grid_cols(2).gap_x_4().gap_y_2();
             for (i, name) in SCRIPT_NAMES.iter().enumerate() {
-                let mut sc = self.s.scripts.clone();
+                let mut sc = self.s.scripts;
                 let on = *script_flag(&mut sc, i);
                 grid = grid.child(
                     Checkbox::new(("script", i))

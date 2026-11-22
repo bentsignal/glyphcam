@@ -24,6 +24,11 @@ use std::sync::mpsc::Receiver;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+/// Background Windows 11 camera setup: None = idle, Some(None) = running,
+/// Some(Some(result)) = finished.
+#[cfg(windows)]
+pub type MfJob = Arc<parking_lot::Mutex<Option<Option<Result<(), String>>>>>;
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
     Look,
@@ -78,7 +83,7 @@ pub struct GlyphUi {
     pub mf_status: crate::mfcam::Status,
     /// Windows 11 camera setup running in the background: None = idle.
     #[cfg(windows)]
-    pub mf_job: Arc<parking_lot::Mutex<Option<Option<Result<(), String>>>>>,
+    pub mf_job: MfJob,
 }
 
 impl GlyphUi {
@@ -186,6 +191,8 @@ impl GlyphUi {
                 ui.update(cx, |this, _| this.window = h);
             }
         }
+        // bring the app to the front (macOS: also when it came from the menu bar)
+        cx.activate(true);
         ui.update(cx, |this, cx| {
             this.visible = true;
             this.sync_preview_wanted();
@@ -532,6 +539,7 @@ impl GlyphUi {
             )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn big_toggle(
         &self,
         id: &'static str,

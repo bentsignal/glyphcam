@@ -80,44 +80,6 @@ pub fn autostart_enabled() -> bool {
         .unwrap_or(false)
 }
 
-/// Hide the whole app (macOS: like Cmd-H; the dock icon stays).
-#[cfg(target_os = "macos")]
-pub fn macos_hide() {
-    use objc2::MainThreadMarker;
-    use objc2_app_kit::NSApplication;
-    if let Some(mtm) = MainThreadMarker::new() {
-        let app = NSApplication::sharedApplication(mtm);
-        #[allow(unused_unsafe)]
-        unsafe {
-            app.hide(None)
-        };
-    }
-}
-
-#[cfg(target_os = "macos")]
-pub fn macos_is_hidden() -> bool {
-    use objc2::MainThreadMarker;
-    use objc2_app_kit::NSApplication;
-    match MainThreadMarker::new() {
-        Some(mtm) => NSApplication::sharedApplication(mtm).isHidden(),
-        None => false,
-    }
-}
-
-#[cfg(target_os = "macos")]
-pub fn macos_show() {
-    use objc2::MainThreadMarker;
-    use objc2_app_kit::NSApplication;
-    if let Some(mtm) = MainThreadMarker::new() {
-        let app = NSApplication::sharedApplication(mtm);
-        #[allow(unused_unsafe, deprecated)]
-        unsafe {
-            app.unhide(None);
-            app.activateIgnoringOtherApps(true);
-        }
-    }
-}
-
 /// Add an inbound Windows Firewall rule for the stream port (UAC prompt).
 #[cfg(windows)]
 pub fn allow_firewall(port: u16) -> anyhow::Result<()> {

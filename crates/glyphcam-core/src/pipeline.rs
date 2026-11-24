@@ -21,6 +21,10 @@ pub struct PipelineStats {
     pub detect_ms: f32,
     pub segment_ms: f32,
     pub render_ms: f32,
+    /// Parts of `render_ms`: waiting for tracking, the depth field, drawing.
+    pub wait_ms: f32,
+    pub depth_ms: f32,
+    pub draw_ms: f32,
 }
 
 pub struct Pipeline {
@@ -84,6 +88,7 @@ impl Pipeline {
             }
             None => self.tracker.state(),
         };
+        let t1 = Instant::now();
         let src_size = img
             .map(|i| (i.width, i.height))
             .unwrap_or((s.out_width, s.out_height));
@@ -116,6 +121,7 @@ impl Pipeline {
             }
             None => self.depth.clear(),
         }
+        let t2 = Instant::now();
         self.stats.depth_ok = self.depth.valid;
         self.stats.depth_m = if self.depth.valid {
             self.depth.z_ref
@@ -136,7 +142,12 @@ impl Pipeline {
             dt,
             &mut self.frame,
         );
-        self.stats.render_ms = t0.elapsed().as_secs_f32() * 1000.0;
+        let ms = |a: Instant, b: Instant| (b - a).as_secs_f32() * 1000.0;
+        let t3 = Instant::now();
+        self.stats.wait_ms = ms(t0, t1);
+        self.stats.depth_ms = ms(t1, t2);
+        self.stats.draw_ms = ms(t2, t3);
+        self.stats.render_ms = ms(t0, t3);
         &self.frame
     }
 }

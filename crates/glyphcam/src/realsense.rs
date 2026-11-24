@@ -24,6 +24,9 @@ const FORMAT_RGB8: c_int = 5;
 const W: c_int = 640;
 const H: c_int = 480;
 const FPS: c_int = 30;
+/// `RS2_OPTION_AUTO_EXPOSURE_PRIORITY`: when on, the colour sensor halves
+/// its frame rate in dim light to expose longer.
+const OPTION_AUTO_EXPOSURE_PRIORITY: c_int = 30;
 
 type Err = *mut c_void;
 type P = *mut c_void;
@@ -86,6 +89,15 @@ struct Api {
     ),
     get_video_stream_intrinsics: unsafe extern "C" fn(P, *mut RsIntrinsics, *mut Err),
     depth_frame_get_units: unsafe extern "C" fn(P, *mut Err) -> f32,
+    pipeline_profile_get_device: unsafe extern "C" fn(P, *mut Err) -> P,
+    delete_device: unsafe extern "C" fn(P),
+    query_sensors: unsafe extern "C" fn(P, *mut Err) -> P,
+    get_sensors_count: unsafe extern "C" fn(P, *mut Err) -> c_int,
+    create_sensor: unsafe extern "C" fn(P, c_int, *mut Err) -> P,
+    delete_sensor: unsafe extern "C" fn(P),
+    delete_sensor_list: unsafe extern "C" fn(P),
+    supports_option: unsafe extern "C" fn(P, c_int, *mut Err) -> c_int,
+    set_option: unsafe extern "C" fn(P, c_int, f32, *mut Err),
     get_error_message: unsafe extern "C" fn(Err) -> *const c_char,
     free_error: unsafe extern "C" fn(Err),
 }
@@ -180,6 +192,15 @@ impl Api {
             get_stream_profile_data: sym!("rs2_get_stream_profile_data"),
             get_video_stream_intrinsics: sym!("rs2_get_video_stream_intrinsics"),
             depth_frame_get_units: sym!("rs2_depth_frame_get_units"),
+            pipeline_profile_get_device: sym!("rs2_pipeline_profile_get_device"),
+            delete_device: sym!("rs2_delete_device"),
+            query_sensors: sym!("rs2_query_sensors"),
+            get_sensors_count: sym!("rs2_get_sensors_count"),
+            create_sensor: sym!("rs2_create_sensor"),
+            delete_sensor: sym!("rs2_delete_sensor"),
+            delete_sensor_list: sym!("rs2_delete_sensor_list"),
+            supports_option: sym!("rs2_supports_option"),
+            set_option: sym!("rs2_set_option"),
             get_error_message: sym!("rs2_get_error_message"),
             free_error: sym!("rs2_free_error"),
             _lib: lib,
@@ -423,12 +444,15 @@ fn run(shared: &(Mutex<Slot>, Condvar), stop: &AtomicBool, desc: &Mutex<String>)
         (a.start_processing_queue)(s.align, s.queue, &mut e);
         a.check(e, "start align")?;
     }
+    // SAFETY: as above.
+    unsafe { keep_full_frame_rate(a, s.profile) };
     *desc.lock() = format!("{W}x{H} colour + depth @ {FPS} fps (RealSense)");
     log::info!("RealSense streaming {W}x{H} colour + aligned depth");
 
     let mut timeouts = 0;
     let mut intr: Option<Intrinsics> = None;
     let (mut n, mut skipped, mut work) = (0u32, 0u32, Duration::ZERO);
+    let (mut incomplete, mut since) = (0u32, std::time::Instant::now());
     while !stop.load(Ordering::Relaxed) {
         // SAFETY: as above; every frame handle obtained here is released.
         let got = unsafe {
@@ -474,12 +498,17 @@ fn run(shared: &(Mutex<Slot>, Condvar), stop: &AtomicBool, desc: &Mutex<String>)
             (a.release_frame)(aligned);
             work += t0.elapsed();
             n += 1;
+            if matches!(r, Ok(None)) {
+                incomplete += 1;
+            }
             if n == 300 {
                 log::info!(
-                    "RealSense: align+copy {:.1} ms/frame, skipped {skipped} stale framesets in {n}",
+                    "RealSense: {:.1} framesets/s, align+copy {:.1} ms/frame, skipped {skipped} stale and {incomplete} incomplete framesets in {n}",
+                    n as f32 / since.elapsed().as_secs_f32(),
                     work.as_secs_f32() * 1000.0 / n as f32
                 );
-                (n, skipped, work) = (0, 0, Duration::ZERO);
+                (n, skipped, incomplete, work) = (0, 0, 0, Duration::ZERO);
+                since = std::time::Instant::now();
             }
             r?
         };
@@ -492,6 +521,51 @@ fn run(shared: &(Mutex<Slot>, Condvar), stop: &AtomicBool, desc: &Mutex<String>)
         }
     }
     Ok(())
+}
+
+/// Turn off auto-exposure priority on every sensor that has it: in a dim
+/// room the colour camera otherwise drops from 30 to 15 fps to expose
+/// longer. The picture gets darker instead, which our exposure lifts.
+///
+/// # Safety
+/// `profile` must be a live pipeline profile.
+unsafe fn keep_full_frame_rate(a: &Api, profile: P) {
+    let mut e: Err = std::ptr::null_mut();
+    let dev = (a.pipeline_profile_get_device)(profile, &mut e);
+    if a.check(e, "device").is_err() || dev.is_null() {
+        return;
+    }
+    e = std::ptr::null_mut();
+    let list = (a.query_sensors)(dev, &mut e);
+    if a.check(e, "sensors").is_ok() && !list.is_null() {
+        e = std::ptr::null_mut();
+        let count = (a.get_sensors_count)(list, &mut e);
+        let count = if a.check(e, "sensor count").is_ok() {
+            count
+        } else {
+            0
+        };
+        for i in 0..count {
+            e = std::ptr::null_mut();
+            let sensor = (a.create_sensor)(list, i, &mut e);
+            if a.check(e, "sensor").is_err() || sensor.is_null() {
+                continue;
+            }
+            e = std::ptr::null_mut();
+            let has = (a.supports_option)(sensor, OPTION_AUTO_EXPOSURE_PRIORITY, &mut e);
+            if a.check(e, "supports option").is_ok() && has != 0 {
+                e = std::ptr::null_mut();
+                (a.set_option)(sensor, OPTION_AUTO_EXPOSURE_PRIORITY, 0.0, &mut e);
+                match a.check(e, "auto-exposure priority") {
+                    Ok(()) => log::info!("RealSense: auto-exposure priority off (sensor {i})"),
+                    Err(err) => log::warn!("RealSense: {err:#}"),
+                }
+            }
+            (a.delete_sensor)(sensor);
+        }
+        (a.delete_sensor_list)(list);
+    }
+    (a.delete_device)(dev);
 }
 
 /// Copy the colour and depth out of an aligned frameset.

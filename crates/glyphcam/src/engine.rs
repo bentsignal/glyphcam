@@ -468,8 +468,11 @@ fn run(sh: Arc<Shared>) {
         if now < next_due {
             if synthetic {
                 std::thread::sleep(next_due - now);
-            } else if next_due - now > interval / 4 {
-                continue; // camera faster than output fps: drop this frame
+            } else if next_due - now > interval / 2 {
+                // camera faster than output fps: drop this frame (only when
+                // clearly early, so a camera at the output rate with a bit
+                // of timing jitter never loses frames)
+                continue;
             }
         }
         let now = Instant::now();
@@ -514,8 +517,9 @@ fn run(sh: Arc<Shared>) {
             log_tick += 1;
             if log_tick % 10 == 1 {
                 log::info!(
-                    "engine: {:.1} fps, detect {:.1} ms, mask {:.1} ms, frame {:.1} ms, face {}, preview {}, vcam reader {}",
+                    "engine: {:.1} fps, detect {:.1} ms, mask {:.1} ms, frame {:.1} ms (wait {:.1}, depth {:.1}, draw {:.1}), face {}, preview {}, vcam reader {}",
                     st.fps, pipeline.stats.detect_ms, pipeline.stats.segment_ms, pipeline.stats.render_ms,
+                    pipeline.stats.wait_ms, pipeline.stats.depth_ms, pipeline.stats.draw_ms,
                     pipeline.stats.face_found, previewing, consumer
                 );
             }

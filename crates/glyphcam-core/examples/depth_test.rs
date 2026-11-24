@@ -58,6 +58,7 @@ fn main() -> anyhow::Result<()> {
         };
         p.reset_motion();
         let (mut total, mut frames, mut faces) = (0.0f32, 0u32, 0u32);
+        let mut parts = [0.0f32; 3];
         let last = *shots.iter().max().unwrap();
         // warm up for a second before the first shot
         let first = shots.iter().min().unwrap().saturating_sub(30);
@@ -67,6 +68,9 @@ fn main() -> anyhow::Result<()> {
             p.process(Some(&f), &s, 1.0 / 30.0);
             total += t0.elapsed().as_secs_f32() * 1000.0;
             frames += 1;
+            parts[0] += p.stats.wait_ms;
+            parts[1] += p.stats.depth_ms;
+            parts[2] += p.stats.draw_ms;
             faces += p.stats.face_found as u32;
             if shots.contains(&i) {
                 {
@@ -100,6 +104,13 @@ fn main() -> anyhow::Result<()> {
                 )?;
             }
         }
+        let n = frames as f32;
+        println!(
+            "{name:16} wait={:.1} depth={:.1} draw={:.1}",
+            parts[0] / n,
+            parts[1] / n,
+            parts[2] / n
+        );
         println!(
             "{name:16} frames={frames} faces={faces} avg_ms={:.2} render_ms={:.2} detect_ms={:.1} segment_ms={:.1} depth_ok={} face_at={:.2}m",
             total / frames as f32,
